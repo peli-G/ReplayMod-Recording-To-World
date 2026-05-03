@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "com.pelig.replaytoworld.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ClientboundLevelChunkPacketDataAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
