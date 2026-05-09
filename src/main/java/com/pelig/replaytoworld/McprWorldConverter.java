@@ -32,8 +32,8 @@ import java.util.zip.ZipFile;
 
 public class McprWorldConverter {
 
-    private static final int    DATA_VERSION = 4556; // 1.21.10
-    private static final String VERSION_NAME = "1.21.10";
+    private static final int    DATA_VERSION = net.minecraft.SharedConstants.getCurrentVersion().dataVersion().version();
+    private static final String VERSION_NAME = net.minecraft.SharedConstants.getCurrentVersion().name();
 
     public static volatile boolean running = false;
 
