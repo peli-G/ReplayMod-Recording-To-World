@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "replay-to-world",
-  "version": "1.0.2",
+  "version": "1.3.0",
   "name": "Replay to World",
   "description": "Converts a ReplayMod .mcpr recording into a playable singleplayer world by extracting every chunk packet from the recording. Use /replaytoworld <filename>",
   "authors": ["peli_G"],

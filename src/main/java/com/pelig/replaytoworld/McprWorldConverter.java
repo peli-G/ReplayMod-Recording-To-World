@@ -40,7 +40,6 @@ public class McprWorldConverter {
     public static boolean start(Path mcprPath, RegistryAccess registryAccess, Minecraft mc) {
         if (running) return false;
         running = true;
-
         Thread t = new Thread(() -> {
             try {
                 convert(mcprPath, registryAccess, mc);
@@ -65,21 +64,27 @@ public class McprWorldConverter {
 
         sendMessage(mc, "§a[ReplayToWorld] Opening " + mcprPath.getFileName() + " ...");
 
-        // ── Build the game packet codec ───────────────────────────────────────
         var gamePacketCodec = GameProtocols.CLIENTBOUND_TEMPLATE
                 .bind(RegistryFriendlyByteBuf.decorator(registryAccess))
                 .codec();
 
-        // ── Parse the .tmcpr packet stream ────────────────────────────────────
-        // Format: [4-byte BE timestamp][4-byte BE length][length bytes of raw packet]
-        // Raw packet bytes begin with a VarInt packet ID, which gamePacketCodec handles.
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE 1 — Scan the tmcpr stream
+        //
+        // .tmcpr format: [4-byte BE timestamp][4-byte BE length][N bytes packet]
+        // We decode every packet but store NOTHING for chunk packets beyond
+        // their byte offset in the stream and (dim, chunkPos) key.
+        // Last occurrence of each (dim, chunkPos) pair wins.
+        //
+        // Memory: O(unique chunks) — a few longs/strings per chunk, not
+        // decoded PalettedContainers. For 20K chunks that's a few MB.
+        // ═══════════════════════════════════════════════════════════════════
+        sendMessage(mc, "§a[ReplayToWorld] Phase 1/2: Scanning packets...");
 
-        // We collect the *last seen* chunk packet per (dimension, chunkPos) — later
-        // packets overwrite earlier ones, giving us the most up-to-date terrain.
-        Map<String, Map<Long, ClientboundLevelChunkWithLightPacket>> dimChunkMap = new LinkedHashMap<>();
+        // (dim, chunkPosLong) → byte offset of the winning packet's start
+        Map<String, Map<Long, Long>> dimPosToWinnerOffset = new LinkedHashMap<>();
         String[] currentDimension = {"minecraft:overworld"};
         int packetCount = 0;
-        int chunkPacketCount = 0;
 
         try (ZipFile zip = new ZipFile(mcprPath.toFile())) {
             var tmcprEntry = zip.getEntry("recording.tmcpr");
@@ -88,87 +93,79 @@ public class McprWorldConverter {
                 return;
             }
 
-            long fileSize = tmcprEntry.getSize();
-
             try (DataInputStream dis = new DataInputStream(
                     new BufferedInputStream(zip.getInputStream(tmcprEntry), 1 << 20))) {
 
+                long bytePos = 0;
                 while (true) {
-                    // Read header — 4-byte timestamp + 4-byte length
+                    long packetStart = bytePos;
+
                     int timestamp;
-                    try {
-                        timestamp = dis.readInt(); // big-endian; value in ms
-                    } catch (EOFException e) {
-                        break; // clean end of stream
-                    }
+                    try { timestamp = dis.readInt(); } catch (EOFException e) { break; }
+                    bytePos += 4;
 
                     int length;
-                    try {
-                        length = dis.readInt();
-                    } catch (EOFException e) {
-                        break;
-                    }
+                    try { length = dis.readInt(); } catch (EOFException e) { break; }
+                    bytePos += 4;
 
                     if (length <= 0 || length > 2_097_152) {
-                        // Corrupt / unreasonably large packet — skip and abort
                         ReplayToWorldMod.LOGGER.warn(
-                                "[ReplayToWorld] Suspicious packet length {} at t={}ms, stopping parse", length, timestamp);
+                                "[ReplayToWorld] Suspicious packet length {} at offset {}, stopping", length, packetStart);
                         break;
                     }
 
                     byte[] data = new byte[length];
-                    try {
-                        dis.readFully(data);
-                    } catch (EOFException e) {
-                        break;
-                    }
-
+                    try { dis.readFully(data); } catch (EOFException e) { break; }
+                    bytePos += length;
                     packetCount++;
 
-                    // Progress update every 5 000 packets
-                    if (packetCount % 5000 == 0) {
+                    if (packetCount % 10_000 == 0) {
                         setActionBar(mc, "Scanning packets", packetCount, -1);
                     }
 
-                    // Decode the packet
                     var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
                     try {
                         var pkt = gamePacketCodec.decode(buf);
 
                         if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
-                            // Track dimension → last-seen chunk at each position
-                            dimChunkMap
-                                .computeIfAbsent(currentDimension[0], k -> new LinkedHashMap<>())
-                                .put(ChunkPos.asLong(cp.getX(), cp.getZ()), cp);
-                            chunkPacketCount++;
+                            // Record the byte offset of this packet — don't keep cp itself
+                            long chunkPosLong = ChunkPos.asLong(cp.getX(), cp.getZ());
+                            dimPosToWinnerOffset
+                                    .computeIfAbsent(currentDimension[0], k -> new LinkedHashMap<>())
+                                    .put(chunkPosLong, packetStart);
 
                         } else if (pkt instanceof ClientboundLoginPacket lp) {
-                            currentDimension[0] = parseDimension(
-                                    lp.commonPlayerSpawnInfo().dimension().toString());
+                            currentDimension[0] = parseDimension(lp.commonPlayerSpawnInfo().dimension().toString());
 
                         } else if (pkt instanceof ClientboundRespawnPacket rp) {
-                            currentDimension[0] = parseDimension(
-                                    rp.commonPlayerSpawnInfo().dimension().toString());
+                            currentDimension[0] = parseDimension(rp.commonPlayerSpawnInfo().dimension().toString());
                         }
 
-                    } catch (Exception ignored) {
-                        // Unknown or undecodable packet — skip silently
-                    }
+                    } catch (Exception ignored) {}
                 }
             }
         }
 
-        int totalChunks = dimChunkMap.values().stream().mapToInt(Map::size).sum();
-        sendMessage(mc, "§a[ReplayToWorld] Scanned " + packetCount + " packets → "
-                + totalChunks + " unique chunk positions across "
-                + dimChunkMap.size() + " dimension(s).");
+        int totalChunks = dimPosToWinnerOffset.values().stream().mapToInt(Map::size).sum();
+        sendMessage(mc, "§a[ReplayToWorld] Phase 1 done: scanned " + packetCount + " packets → "
+                + totalChunks + " unique chunks across " + dimPosToWinnerOffset.size() + " dimension(s).");
 
-        if (dimChunkMap.isEmpty()) {
+        if (dimPosToWinnerOffset.isEmpty()) {
             sendMessage(mc, "§c[ReplayToWorld] No chunks found — nothing to export.");
             return;
         }
 
-        // ── Create output world folder ────────────────────────────────────────
+        // Build a flat set of winner offsets and a reverse map offset → dim
+        Set<Long>         winnerOffsets    = new HashSet<>();
+        Map<Long, String> winnerOffsetToDim = new HashMap<>();
+        for (var dimEntry : dimPosToWinnerOffset.entrySet()) {
+            for (long offset : dimEntry.getValue().values()) {
+                winnerOffsets.add(offset);
+                winnerOffsetToDim.put(offset, dimEntry.getKey());
+            }
+        }
+
+        // Create output world
         String baseName = mcprPath.getFileName().toString()
                 .replaceAll("\\.[^.]+$", "")
                 .replaceAll("[\\\\/:*?\"<>|]", "_");
@@ -182,103 +179,153 @@ public class McprWorldConverter {
         Files.createDirectories(worldPath);
         writeLevelDat(worldPath, baseName);
 
-        // ── Codec setup ───────────────────────────────────────────────────────
         var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
         var ops = registryAccess.createSerializationContext(NbtOps.INSTANCE);
-
         var blockCodec = PalettedContainer.codecRW(
                 BlockState.CODEC,
                 Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
                 Blocks.AIR.defaultBlockState());
-
         com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec =
                 PalettedContainer.codecRO(
                         biomeRegistry.holderByNameCodec(),
                         Strategy.createForBiomes(biomeRegistry.asHolderIdMap()),
                         biomeRegistry.getOrThrow(Biomes.PLAINS));
 
-        // ── Write chunks per dimension ────────────────────────────────────────
+        // Pre-create dimension directories
+        Map<String, Path> dimPaths = new LinkedHashMap<>();
+        for (String dimId : dimPosToWinnerOffset.keySet()) {
+            Path dp = resolveDimPath(worldPath, dimId);
+            Files.createDirectories(dp.resolve("region"));
+            Files.createDirectories(dp.resolve("entities"));
+            dimPaths.put(dimId, dp);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE 2 — Re-read the stream, decode and write only winner packets
+        //
+        // For non-winners we call skipFully() — zero allocation, no decode.
+        // For winners we decode once and write immediately; the object is
+        // eligible for GC as soon as the loop advances.
+        //
+        // Peak heap: one decoded chunk packet at a time regardless of how
+        // many chunks the replay contains.
+        // ═══════════════════════════════════════════════════════════════════
+        sendMessage(mc, "§a[ReplayToWorld] Phase 2/2: Writing chunks...");
+
+        Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
+        Map<String, Map<Long, RegionFileWriter>> entityWriters = new HashMap<>();
         int written = 0, skipped = 0;
 
-        for (Map.Entry<String, Map<Long, ClientboundLevelChunkWithLightPacket>> dimEntry
-                : dimChunkMap.entrySet()) {
+        try (ZipFile zip = new ZipFile(mcprPath.toFile())) {
+            var tmcprEntry = zip.getEntry("recording.tmcpr");
+            try (DataInputStream dis = new DataInputStream(
+                    new BufferedInputStream(zip.getInputStream(tmcprEntry), 1 << 20))) {
 
-            String dimId   = dimEntry.getKey();
-            Map<Long, ClientboundLevelChunkWithLightPacket> chunkMap = dimEntry.getValue();
+                long bytePos = 0;
+                while (true) {
+                    long packetStart = bytePos;
 
-            Path dimPath = worldPath;
-            if (dimId.equals("minecraft:the_nether")) {
-                dimPath = worldPath.resolve("DIM-1");
-            } else if (dimId.equals("minecraft:the_end")) {
-                dimPath = worldPath.resolve("DIM1");
-            } else if (!dimId.equals("minecraft:overworld")) {
-                String[] parts = dimId.split(":", 2);
-                dimPath = worldPath.resolve("dimensions").resolve(parts[0]).resolve(parts[1]);
-            }
+                    int timestamp;
+                    try { timestamp = dis.readInt(); } catch (EOFException e) { break; }
+                    bytePos += 4;
 
-            Files.createDirectories(dimPath.resolve("region"));
-            Files.createDirectories(dimPath.resolve("entities"));
+                    int length;
+                    try { length = dis.readInt(); } catch (EOFException e) { break; }
+                    bytePos += 4;
 
-            Map<Long, RegionFileWriter> regionWriters = new HashMap<>();
-            Map<Long, RegionFileWriter> entityWriters = new HashMap<>();
+                    if (length <= 0 || length > 2_097_152) break;
 
-            int dimTotal   = chunkMap.size();
-            int dimWritten = 0;
+                    if (!winnerOffsets.contains(packetStart)) {
+                        // Not a winner — skip cheaply without allocating
+                        skipFully(dis, length);
+                        bytePos += length;
+                        continue;
+                    }
 
-            for (ClientboundLevelChunkWithLightPacket packet : chunkMap.values()) {
-                ChunkPos pos       = new ChunkPos(packet.getX(), packet.getZ());
-                long     regionKey = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
-                String   regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
+                    byte[] data = new byte[length];
+                    try { dis.readFully(data); } catch (EOFException e) { break; }
+                    bytePos += length;
 
-                if (dimWritten % 16 == 0) {
-                    String shortDim = dimId.contains(":") ? dimId.split(":")[1] : dimId;
-                    setActionBar(mc, "Writing " + shortDim, dimWritten, dimTotal);
+                    if (written % 16 == 0) {
+                        setActionBar(mc, "Writing chunks", written, totalChunks);
+                    }
+
+                    String dim = winnerOffsetToDim.get(packetStart);
+                    var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
+                    try {
+                        var pkt = gamePacketCodec.decode(buf);
+                        if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
+                            ChunkPos pos      = new ChunkPos(cp.getX(), cp.getZ());
+                            long regionKey    = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
+                            String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
+                            Path dimPath      = dimPaths.get(dim);
+
+                            CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess);
+                            CompoundTag entityNbt = buildEntityChunkNbt(pos);
+
+                            final Path dPath  = dimPath;
+                            final String fDim = dim;
+                            regionWriters.computeIfAbsent(fDim, k -> new HashMap<>())
+                                    .computeIfAbsent(regionKey, k -> {
+                                        try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
+                                        catch (Exception e) { throw new RuntimeException(e); }
+                                    }).write(pos, chunkNbt);
+                            entityWriters.computeIfAbsent(fDim, k -> new HashMap<>())
+                                    .computeIfAbsent(regionKey, k -> {
+                                        try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
+                                        catch (Exception e) { throw new RuntimeException(e); }
+                                    }).write(pos, entityNbt);
+
+                            written++;
+                        }
+                    } catch (Exception e) {
+                        ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] Skipped chunk at offset {}: {}", packetStart, e.getMessage());
+                        skipped++;
+                    }
                 }
-
-                try {
-                    CompoundTag chunkNbt  = buildChunkNbt(packet, ops, blockCodec, biomeCodec, registryAccess);
-                    CompoundTag entityNbt = buildEntityChunkNbt(pos);
-
-                    final Path dPath = dimPath;
-                    regionWriters.computeIfAbsent(regionKey, k -> {
-                        try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
-                        catch (Exception e) { throw new RuntimeException(e); }
-                    }).write(pos, chunkNbt);
-
-                    entityWriters.computeIfAbsent(regionKey, k -> {
-                        try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
-                        catch (Exception e) { throw new RuntimeException(e); }
-                    }).write(pos, entityNbt);
-
-                    written++;
-                    dimWritten++;
-                } catch (Exception e) {
-                    ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] Skipped {}/{}: {}", dimId, pos, e.getMessage());
-                    skipped++;
-                    dimWritten++;
-                }
             }
-
-            for (RegionFileWriter w : regionWriters.values()) w.close();
-            for (RegionFileWriter w : entityWriters.values()) w.close();
         }
+
+        for (var m : regionWriters.values()) for (var w : m.values()) w.close();
+        for (var m : entityWriters.values()) for (var w : m.values()) w.close();
 
         clearActionBar(mc);
         sendMessage(mc, "§a[ReplayToWorld] Done! " + written + " chunks written"
                 + (skipped > 0 ? " (" + skipped + " skipped)" : "")
-                + " across " + dimChunkMap.size() + " dimension(s)"
+                + " across " + dimPosToWinnerOffset.size() + " dimension(s)"
                 + " → saves/" + worldPath.getFileName());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /** Parse dimension ID from ResourceKey.toString() like "ResourceKey[minecraft:dimension / minecraft:overworld]" */
     private static String parseDimension(String toString) {
         int slash = toString.indexOf('/');
-        if (slash >= 0) {
-            return toString.substring(slash + 2, toString.length() - 1).trim();
-        }
+        if (slash >= 0) return toString.substring(slash + 2, toString.length() - 1).trim();
         return "minecraft:overworld";
+    }
+
+    private static Path resolveDimPath(Path worldPath, String dimId) {
+        return switch (dimId) {
+            case "minecraft:overworld"  -> worldPath;
+            case "minecraft:the_nether" -> worldPath.resolve("DIM-1");
+            case "minecraft:the_end"    -> worldPath.resolve("DIM1");
+            default -> {
+                String[] parts = dimId.split(":", 2);
+                yield worldPath.resolve("dimensions").resolve(parts[0]).resolve(parts[1]);
+            }
+        };
+    }
+
+    private static void skipFully(InputStream is, long n) throws IOException {
+        while (n > 0) {
+            long s = is.skip(n);
+            if (s > 0) { n -= s; continue; }
+            int chunk = (int) Math.min(n, 8192);
+            byte[] discard = new byte[chunk];
+            int r = is.read(discard, 0, chunk);
+            if (r < 0) break;
+            n -= r;
+        }
     }
 
     // ── Chunk NBT ─────────────────────────────────────────────────────────────
@@ -295,7 +342,7 @@ public class McprWorldConverter {
         int cz = packet.getZ();
         var chunkData = packet.getChunkData();
 
-        byte[] rawBuffer = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).rtw$getBuffer();
+        byte[] rawBuffer  = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).rtw$getBuffer();
         List<?> beInfoList = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).rtw$getBlockEntitiesData();
 
         var rfbb = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(rawBuffer), registryAccess);
@@ -304,20 +351,19 @@ public class McprWorldConverter {
         int sectionCount = 24;
         ListTag sections = new ListTag();
 
-        var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
+        var biomeRegistry  = registryAccess.lookupOrThrow(Registries.BIOME);
         Holder<Biome> defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
 
-        // ── Extract light data from the packet ───────────────────────────────
-        var lightData = packet.getLightData();
-        java.util.BitSet skyMask    = lightData.getSkyYMask();
-        java.util.BitSet blockMask  = lightData.getBlockYMask();
-        java.util.BitSet emptySky   = lightData.getEmptySkyYMask();
-        java.util.BitSet emptyBlock = lightData.getEmptyBlockYMask();
-        java.util.List<byte[]> skyArrays   = lightData.getSkyUpdates();
-        java.util.List<byte[]> blockArrays = lightData.getBlockUpdates();
+        var lightData   = packet.getLightData();
+        var skyMask     = lightData.getSkyYMask();
+        var blockMask   = lightData.getBlockYMask();
+        var emptySky    = lightData.getEmptySkyYMask();
+        var emptyBlock  = lightData.getEmptyBlockYMask();
+        var skyArrays   = lightData.getSkyUpdates();
+        var blockArrays = lightData.getBlockUpdates();
 
-        java.util.Map<Integer, byte[]> skyBySection   = new java.util.HashMap<>();
-        java.util.Map<Integer, byte[]> blockBySection = new java.util.HashMap<>();
+        Map<Integer, byte[]> skyBySection   = new HashMap<>();
+        Map<Integer, byte[]> blockBySection = new HashMap<>();
         int skyIdx = 0, blockIdx = 0;
         int totalLightSections = sectionCount + 2;
         for (int li = 0; li < totalLightSections; li++) {
@@ -330,7 +376,7 @@ public class McprWorldConverter {
             CompoundTag sec = new CompoundTag();
             sec.putInt("Y", sectionY);
 
-            rfbb.readShort(); // non-empty block count — discard
+            rfbb.readShort();
 
             PalettedContainer<BlockState> states = new PalettedContainer<>(
                     Blocks.AIR.defaultBlockState(),
@@ -342,17 +388,15 @@ public class McprWorldConverter {
                     Strategy.createForBiomes(biomeRegistry.asHolderIdMap()));
             biomes.read(rfbb);
 
-            blockCodec.encodeStart(ops, states).result()
-                    .ifPresent(tag -> sec.put("block_states", tag));
-            biomeCodec.encodeStart(ops, biomes).result()
-                    .ifPresent(tag -> sec.put("biomes", tag));
+            blockCodec.encodeStart(ops, states).result().ifPresent(t -> sec.put("block_states", t));
+            biomeCodec.encodeStart(ops, biomes).result().ifPresent(t -> sec.put("biomes", t));
 
             int li = si + 1;
             byte[] skyArr   = skyBySection.get(li);
             byte[] blockArr = blockBySection.get(li);
-            if (skyArr != null)         sec.putByteArray("SkyLight",   skyArr);
-            else if (!emptySky.get(li)) sec.putByteArray("SkyLight",   new byte[2048]);
-            if (blockArr != null)         sec.putByteArray("BlockLight", blockArr);
+            if (skyArr   != null) sec.putByteArray("SkyLight",   skyArr);
+            else if (!emptySky.get(li))   sec.putByteArray("SkyLight",   new byte[2048]);
+            if (blockArr != null) sec.putByteArray("BlockLight", blockArr);
             else if (!emptyBlock.get(li)) sec.putByteArray("BlockLight", new byte[2048]);
 
             sections.add(sec);
@@ -362,44 +406,38 @@ public class McprWorldConverter {
         for (var beInfoRaw : beInfoList) {
             try {
                 Class<?> beInfoClass = beInfoRaw.getClass();
-                java.lang.reflect.Field fPackedXZ = beInfoClass.getDeclaredField("packedXZ");
-                java.lang.reflect.Field fY        = beInfoClass.getDeclaredField("y");
-                java.lang.reflect.Field fType     = beInfoClass.getDeclaredField("type");
-                java.lang.reflect.Field fTag      = beInfoClass.getDeclaredField("tag");
-                fPackedXZ.setAccessible(true); fY.setAccessible(true);
-                fType.setAccessible(true);     fTag.setAccessible(true);
+                var fPackedXZ = beInfoClass.getDeclaredField("packedXZ"); fPackedXZ.setAccessible(true);
+                var fY        = beInfoClass.getDeclaredField("y");         fY.setAccessible(true);
+                var fType     = beInfoClass.getDeclaredField("type");      fType.setAccessible(true);
+                var fTag      = beInfoClass.getDeclaredField("tag");       fTag.setAccessible(true);
 
                 int packedXZ = (int) fPackedXZ.get(beInfoRaw);
                 int beY      = (int) fY.get(beInfoRaw);
-                net.minecraft.world.level.block.entity.BlockEntityType<?> beType =
-                        (net.minecraft.world.level.block.entity.BlockEntityType<?>) fType.get(beInfoRaw);
-                net.minecraft.nbt.CompoundTag rawTag =
-                        (net.minecraft.nbt.CompoundTag) fTag.get(beInfoRaw);
+                var beType   = (net.minecraft.world.level.block.entity.BlockEntityType<?>) fType.get(beInfoRaw);
+                var rawTag   = (CompoundTag) fTag.get(beInfoRaw);
 
                 int worldX = cx * 16 + (packedXZ >> 4);
                 int worldZ = cz * 16 + (packedXZ & 0xF);
                 CompoundTag beTag = rawTag != null ? rawTag.copy() : new CompoundTag();
                 beTag.putString("id", BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(beType).toString());
-                beTag.putInt("x", worldX);
-                beTag.putInt("y", beY);
-                beTag.putInt("z", worldZ);
+                beTag.putInt("x", worldX); beTag.putInt("y", beY); beTag.putInt("z", worldZ);
                 beTag.putByte("keepPacked", (byte) 0);
                 blockEntities.add(beTag);
             } catch (Exception ignored) {}
         }
 
         CompoundTag chunk = new CompoundTag();
-        chunk.putInt("DataVersion", DATA_VERSION);
-        chunk.putInt("xPos", cx);
-        chunk.putInt("zPos", cz);
-        chunk.putInt("yPos", minSectionY);
-        chunk.putString("Status", "full");
-        chunk.putLong("LastUpdate", 0L);
+        chunk.putInt("DataVersion",    DATA_VERSION);
+        chunk.putInt("xPos",           cx);
+        chunk.putInt("zPos",           cz);
+        chunk.putInt("yPos",           minSectionY);
+        chunk.putString("Status",      "full");
+        chunk.putLong("LastUpdate",    0L);
         chunk.putLong("InhabitedTime", 0L);
-        chunk.put("sections", sections);
-        chunk.put("block_entities", blockEntities);
-        chunk.put("Heightmaps", new CompoundTag());
-        chunk.putByte("isLightOn", (byte) 1);
+        chunk.put("sections",          sections);
+        chunk.put("block_entities",    blockEntities);
+        chunk.put("Heightmaps",        new CompoundTag());
+        chunk.putByte("isLightOn",     (byte) 1);
         return chunk;
     }
 
@@ -415,38 +453,38 @@ public class McprWorldConverter {
 
     private static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
         CompoundTag data = new CompoundTag();
-        data.putInt("DataVersion", DATA_VERSION);
+        data.putInt("DataVersion",  DATA_VERSION);
         data.putString("LevelName", worldName);
-        data.putLong("LastPlayed", System.currentTimeMillis());
-        data.putInt("version", 19133);
-        data.putInt("GameType", 1);
-        data.putByte("Difficulty", (byte) 2);
+        data.putLong("LastPlayed",  System.currentTimeMillis());
+        data.putInt("version",      19133);
+        data.putInt("GameType",     1);
+        data.putByte("Difficulty",  (byte) 2);
         data.putByte("DifficultyLocked", (byte) 0);
         data.putByte("initialized", (byte) 1);
-        data.putByte("hardcore", (byte) 0);
+        data.putByte("hardcore",    (byte) 0);
         data.putByte("allowCommands", (byte) 1);
-        data.putByte("WasModded", (byte) 1);
+        data.putByte("WasModded",   (byte) 1);
 
         data.putLong("Time", 0L);
         data.putLong("DayTime", 0L);
-        data.putByte("raining", (byte) 0);
+        data.putByte("raining",   (byte) 0);
         data.putByte("thundering", (byte) 0);
-        data.putInt("rainTime", 0);
+        data.putInt("rainTime",   0);
         data.putInt("thunderTime", 0);
         data.putInt("clearWeatherTime", 0);
         data.putInt("WanderingTraderSpawnChance", 25);
-        data.putInt("WanderingTraderSpawnDelay", 24000);
+        data.putInt("WanderingTraderSpawnDelay",  24000);
 
         CompoundTag spawn = new CompoundTag();
         spawn.put("pos", new net.minecraft.nbt.IntArrayTag(new int[]{8, -64, 8}));
         spawn.putFloat("pitch", 0.0f);
-        spawn.putFloat("yaw", 0.0f);
+        spawn.putFloat("yaw",   0.0f);
         spawn.putString("dimension", "minecraft:overworld");
         data.put("spawn", spawn);
 
         CompoundTag version = new CompoundTag();
-        version.putString("Name", VERSION_NAME);
-        version.putInt("Id", DATA_VERSION);
+        version.putString("Name",   VERSION_NAME);
+        version.putInt("Id",        DATA_VERSION);
         version.putString("Series", "main");
         version.putByte("Snapshot", (byte) 0);
         data.put("Version", version);
@@ -520,13 +558,13 @@ public class McprWorldConverter {
         data.put("DataPacks", dataPacks);
 
         CompoundTag dragonFight = new CompoundTag();
-        dragonFight.putByte("PreviouslyKilled", (byte) 0);
+        dragonFight.putByte("PreviouslyKilled",   (byte) 0);
         dragonFight.putByte("NeedsStateScanning", (byte) 1);
-        dragonFight.putByte("DragonKilled", (byte) 0);
+        dragonFight.putByte("DragonKilled",       (byte) 0);
         data.put("DragonFight", dragonFight);
 
         data.put("CustomBossEvents", new CompoundTag());
-        data.put("ScheduledEvents", new ListTag());
+        data.put("ScheduledEvents",  new ListTag());
         ListTag serverBrands = new ListTag();
         serverBrands.add(StringTag.valueOf("fabric"));
         data.put("ServerBrands", serverBrands);
@@ -534,17 +572,17 @@ public class McprWorldConverter {
         CompoundTag worldGenSettings = new CompoundTag();
         worldGenSettings.putLong("seed", 0L);
         worldGenSettings.putByte("generate_features", (byte) 0);
-        worldGenSettings.putByte("bonus_chest", (byte) 0);
+        worldGenSettings.putByte("bonus_chest",       (byte) 0);
         CompoundTag dimensions = new CompoundTag();
-        CompoundTag overworld = new CompoundTag();
+        CompoundTag overworld  = new CompoundTag();
         overworld.putString("type", "minecraft:overworld");
         CompoundTag gen = new CompoundTag();
         gen.putString("type", "minecraft:flat");
         CompoundTag genSettings = new CompoundTag();
-        genSettings.put("layers", new ListTag());
+        genSettings.put("layers",  new ListTag());
         genSettings.putString("biome", "minecraft:plains");
         genSettings.putByte("features", (byte) 0);
-        genSettings.putByte("lakes", (byte) 0);
+        genSettings.putByte("lakes",    (byte) 0);
         gen.put("settings", genSettings);
         overworld.put("generator", gen);
         dimensions.put("minecraft:overworld", overworld);
@@ -558,39 +596,35 @@ public class McprWorldConverter {
                 ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array());
     }
 
-    // ── UI helpers ────────────────────────────────────────────────────────────
+    // ── UI helpers ─────────────────────────────────────────────────────────────
 
     private static void sendMessage(Minecraft mc, String message) {
         ReplayToWorldMod.LOGGER.info(message);
         mc.execute(() -> {
-            if (mc.gui != null)
-                mc.gui.getChat().addMessage(Component.literal(message));
+            if (mc.gui != null) mc.gui.getChat().addMessage(Component.literal(message));
         });
     }
 
     private static void setActionBar(Minecraft mc, String stage, int done, int total) {
         String msg;
         if (total < 0) {
-            // indeterminate — just show count
-            msg = "§a[ReplayToWorld] §f" + stage + " §7— §f" + done + " packets processed...";
+            msg = "§a[ReplayToWorld] §f" + stage + " §7— §f" + done + " packets...";
         } else {
-            int clampedDone = Math.min(done, total);
-            int pct    = clampedDone * 100 / total;
-            int filled = Math.max(0, Math.min(20, pct / 5));
-            String bar = "█".repeat(filled) + "░".repeat(20 - filled);
+            int clamped = Math.min(done, total);
+            int pct     = clamped * 100 / total;
+            int filled  = Math.max(0, Math.min(20, pct / 5));
+            String bar  = "█".repeat(filled) + "░".repeat(20 - filled);
             msg = "§a[ReplayToWorld] §f" + stage + " §7[§a" + bar + "§7] §f"
                     + pct + "% §7(" + done + "/" + total + ")";
         }
         mc.execute(() -> {
-            if (mc.gui != null)
-                mc.gui.setOverlayMessage(Component.literal(msg), false);
+            if (mc.gui != null) mc.gui.setOverlayMessage(Component.literal(msg), false);
         });
     }
 
     private static void clearActionBar(Minecraft mc) {
         mc.execute(() -> {
-            if (mc.gui != null)
-                mc.gui.setOverlayMessage(Component.literal(""), false);
+            if (mc.gui != null) mc.gui.setOverlayMessage(Component.literal(""), false);
         });
     }
 }
