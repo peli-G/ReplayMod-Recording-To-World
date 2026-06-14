@@ -260,7 +260,7 @@ public class McprWorldConverter {
                             String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
                             Path dimPath      = dimPaths.get(dim);
 
-                            CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess);
+                            CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, dim);
                             CompoundTag entityNbt = buildEntityChunkNbt(pos);
 
                             final Path dPath  = dimPath;
@@ -336,19 +336,29 @@ public class McprWorldConverter {
             com.mojang.serialization.DynamicOps<Tag> ops,
             com.mojang.serialization.Codec<PalettedContainer<BlockState>> blockCodec,
             com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec,
-            RegistryAccess registryAccess) throws Exception {
+            RegistryAccess registryAccess,
+            String dimension) throws Exception {
 
         int cx = packet.getX();
         int cz = packet.getZ();
         var chunkData = packet.getChunkData();
 
-        byte[] rawBuffer  = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).rtw$getBuffer();
-        List<?> beInfoList = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).rtw$getBlockEntitiesData();
+        byte[] rawBuffer = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).rtw$getBuffer();
 
         var rfbb = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(rawBuffer), registryAccess);
 
-        int minSectionY  = -4;
-        int sectionCount = 24;
+        // Section range depends on dimension's world height
+        // Overworld: Y -64 to 320  -> sections -4 to 19  (24 sections)
+        // Nether/End: Y 0 to 256   -> sections  0 to 15  (16 sections)
+        int minSectionY;
+        int sectionCount;
+        if ("minecraft:the_nether".equals(dimension) || "minecraft:the_end".equals(dimension)) {
+            minSectionY  = 0;
+            sectionCount = 16;
+        } else {
+            minSectionY  = -4;
+            sectionCount = 24;
+        }
         ListTag sections = new ListTag();
 
         var biomeRegistry  = registryAccess.lookupOrThrow(Registries.BIOME);
@@ -402,29 +412,18 @@ public class McprWorldConverter {
             sections.add(sec);
         }
 
+        // Use the confirmed public API: getBlockEntitiesTagsConsumer(x, z) -> Consumer<BlockEntityTagOutput>
+        // BlockEntityTagOutput.accept(BlockPos, BlockEntityType<?>, CompoundTag)
         ListTag blockEntities = new ListTag();
-        for (var beInfoRaw : beInfoList) {
-            try {
-                Class<?> beInfoClass = beInfoRaw.getClass();
-                var fPackedXZ = beInfoClass.getDeclaredField("packedXZ"); fPackedXZ.setAccessible(true);
-                var fY        = beInfoClass.getDeclaredField("y");         fY.setAccessible(true);
-                var fType     = beInfoClass.getDeclaredField("type");      fType.setAccessible(true);
-                var fTag      = beInfoClass.getDeclaredField("tag");       fTag.setAccessible(true);
-
-                int packedXZ = (int) fPackedXZ.get(beInfoRaw);
-                int beY      = (int) fY.get(beInfoRaw);
-                var beType   = (net.minecraft.world.level.block.entity.BlockEntityType<?>) fType.get(beInfoRaw);
-                var rawTag   = (CompoundTag) fTag.get(beInfoRaw);
-
-                int worldX = cx * 16 + (packedXZ >> 4);
-                int worldZ = cz * 16 + (packedXZ & 0xF);
-                CompoundTag beTag = rawTag != null ? rawTag.copy() : new CompoundTag();
-                beTag.putString("id", BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(beType).toString());
-                beTag.putInt("x", worldX); beTag.putInt("y", beY); beTag.putInt("z", worldZ);
-                beTag.putByte("keepPacked", (byte) 0);
-                blockEntities.add(beTag);
-            } catch (Exception ignored) {}
-        }
+        chunkData.getBlockEntitiesTagsConsumer(cx, cz).accept((blockPos, beType, nbt) -> {
+            CompoundTag beTag = nbt != null ? nbt.copy() : new CompoundTag();
+            beTag.putString("id", BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(beType).toString());
+            beTag.putInt("x", blockPos.getX());
+            beTag.putInt("y", blockPos.getY());
+            beTag.putInt("z", blockPos.getZ());
+            beTag.putByte("keepPacked", (byte) 0);
+            blockEntities.add(beTag);
+        });
 
         CompoundTag chunk = new CompoundTag();
         chunk.putInt("DataVersion",    DATA_VERSION);
