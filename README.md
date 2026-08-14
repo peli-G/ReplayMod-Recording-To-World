@@ -16,3 +16,4 @@ ReplayMod is required for this mod to work. You can download it [here](https://m
 
 # Images
 <img width="2560" height="1440" alt="guide" src="https://github.com/user-attachments/assets/25d1f976-7aa5-46f1-b4a1-a7f41e7dbf50" />
+<sub><sup>ik the icon for the button is shit. I had to make it myself ok?<sup><sub>
