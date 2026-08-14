@@ -36,52 +36,101 @@ public class McprWorldConverter {
     private static final String VERSION_NAME = net.minecraft.SharedConstants.getCurrentVersion().name();
 
     public static volatile boolean running = false;
+    public static volatile boolean cancelRequested = false;
+    private static volatile Thread currentThread = null;
+
+    public static volatile String progressPhase = "";
+    public static volatile int progressCurrent = 0;
+    public static volatile int progressTotal = 0;
+    public static volatile String progressWorldName = "";
+    public static volatile boolean progressDone = false;
+    public static volatile String progressResultMessage = "";
+    public static volatile boolean progressFailed = false;
+
+    public static void cancel() {
+        ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Cancel requested by user");
+        cancelRequested = true;
+        Thread t = currentThread;
+        if (t != null) t.interrupt();
+    }
+
+    private static void checkCancelled() {
+        if (cancelRequested || Thread.currentThread().isInterrupted()) {
+            throw new java.util.concurrent.CancellationException("Conversion cancelled");
+        }
+    }
 
     public static boolean start(Path mcprPath, RegistryAccess registryAccess, Minecraft mc) {
-        if (running) return false;
+        ReplayToWorldMod.LOGGER.info("[ReplayToWorld] start() called — path={}, alreadyRunning={}", mcprPath, running);
+        if (running) {
+            ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] start() aborted — a conversion is already running");
+            return false;
+        }
         running = true;
+        cancelRequested = false;
+        progressPhase = "Starting...";
+        progressCurrent = 0;
+        progressTotal = 0;
+        progressWorldName = "";
+        progressDone = false;
+        progressResultMessage = "";
+        progressFailed = false;
         Thread t = new Thread(() -> {
             try {
+                ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Conversion thread started for {}", mcprPath);
                 convert(mcprPath, registryAccess, mc);
-            } catch (Exception e) {
-                ReplayToWorldMod.LOGGER.error("[ReplayToWorld] Conversion failed", e);
+                ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Conversion thread completed normally for {}", mcprPath);
+            } catch (java.util.concurrent.CancellationException e) {
+                ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Conversion cancelled by user");
                 clearActionBar(mc);
-                sendMessage(mc, "§c[ReplayToWorld] Failed: " + e.getMessage() + " — see log.");
+                sendMessage(mc, "§e[ReplayToWorld] Conversion cancelled.");
+                progressResultMessage = "Cancelled.";
+                progressDone = true;
+            } catch (Exception e) {
+                if (cancelRequested) {
+                    ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Conversion stopped due to cancellation");
+                    clearActionBar(mc);
+                    sendMessage(mc, "§e[ReplayToWorld] Conversion cancelled.");
+                    progressResultMessage = "Cancelled.";
+                    progressDone = true;
+                } else {
+                    ReplayToWorldMod.LOGGER.error("[ReplayToWorld] Conversion failed", e);
+                    clearActionBar(mc);
+                    sendMessage(mc, "§c[ReplayToWorld] Failed: " + e.getMessage() + " — see log.");
+                    progressFailed = true;
+                    progressResultMessage = "Failed: " + e.getMessage();
+                    progressDone = true;
+                }
             } finally {
                 running = false;
+                currentThread = null;
             }
         }, "replay-to-world");
         t.setDaemon(true);
+        currentThread = t;
         t.start();
+        ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Conversion thread launched, start() returning true");
         return true;
     }
 
     private static void convert(Path mcprPath, RegistryAccess registryAccess, Minecraft mc) throws Exception {
         if (!Files.exists(mcprPath)) {
             sendMessage(mc, "§c[ReplayToWorld] File not found: " + mcprPath);
+            progressFailed = true;
+            progressResultMessage = "File not found: " + mcprPath.getFileName();
+            progressDone = true;
             return;
         }
 
         sendMessage(mc, "§a[ReplayToWorld] Opening " + mcprPath.getFileName() + " ...");
+        progressPhase = "Opening " + mcprPath.getFileName();
 
         var gamePacketCodec = GameProtocols.CLIENTBOUND_TEMPLATE
                 .bind(RegistryFriendlyByteBuf.decorator(registryAccess))
                 .codec();
 
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 1 — Scan the tmcpr stream
-        //
-        // .tmcpr format: [4-byte BE timestamp][4-byte BE length][N bytes packet]
-        // We decode every packet but store NOTHING for chunk packets beyond
-        // their byte offset in the stream and (dim, chunkPos) key.
-        // Last occurrence of each (dim, chunkPos) pair wins.
-        //
-        // Memory: O(unique chunks) — a few longs/strings per chunk, not
-        // decoded PalettedContainers. For 20K chunks that's a few MB.
-        // ═══════════════════════════════════════════════════════════════════
         sendMessage(mc, "§a[ReplayToWorld] Phase 1/2: Scanning packets...");
 
-        // (dim, chunkPosLong) → byte offset of the winning packet's start
         Map<String, Map<Long, Long>> dimPosToWinnerOffset = new LinkedHashMap<>();
         String[] currentDimension = {"minecraft:overworld"};
         int packetCount = 0;
@@ -90,6 +139,9 @@ public class McprWorldConverter {
             var tmcprEntry = zip.getEntry("recording.tmcpr");
             if (tmcprEntry == null) {
                 sendMessage(mc, "§c[ReplayToWorld] No recording.tmcpr found inside " + mcprPath.getFileName());
+                progressFailed = true;
+                progressResultMessage = "No recording.tmcpr found inside " + mcprPath.getFileName();
+                progressDone = true;
                 return;
             }
 
@@ -120,7 +172,11 @@ public class McprWorldConverter {
                     packetCount++;
 
                     if (packetCount % 10_000 == 0) {
+                        checkCancelled();
                         setActionBar(mc, "Scanning packets", packetCount, -1);
+                        progressPhase = "Scanning packets";
+                        progressCurrent = packetCount;
+                        progressTotal = 0;
                     }
 
                     var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
@@ -128,7 +184,7 @@ public class McprWorldConverter {
                         var pkt = gamePacketCodec.decode(buf);
 
                         if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
-                            // Record the byte offset of this packet — don't keep cp itself
+
                             long chunkPosLong = ChunkPos.asLong(cp.getX(), cp.getZ());
                             dimPosToWinnerOffset
                                     .computeIfAbsent(currentDimension[0], k -> new LinkedHashMap<>())
@@ -152,10 +208,12 @@ public class McprWorldConverter {
 
         if (dimPosToWinnerOffset.isEmpty()) {
             sendMessage(mc, "§c[ReplayToWorld] No chunks found — nothing to export.");
+            progressFailed = true;
+            progressResultMessage = "No chunks found — nothing to export.";
+            progressDone = true;
             return;
         }
 
-        // Build a flat set of winner offsets and a reverse map offset → dim
         Set<Long>         winnerOffsets    = new HashSet<>();
         Map<Long, String> winnerOffsetToDim = new HashMap<>();
         for (var dimEntry : dimPosToWinnerOffset.entrySet()) {
@@ -165,7 +223,6 @@ public class McprWorldConverter {
             }
         }
 
-        // Create output world
         String baseName = mcprPath.getFileName().toString()
                 .replaceAll("\\.[^.]+$", "")
                 .replaceAll("[\\\\/:*?\"<>|]", "_");
@@ -177,6 +234,7 @@ public class McprWorldConverter {
             worldPath = savesDir.resolve(baseName + "_" + i);
         }
         Files.createDirectories(worldPath);
+        progressWorldName = worldPath.getFileName().toString();
         writeLevelDat(worldPath, baseName);
 
         var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
@@ -191,7 +249,6 @@ public class McprWorldConverter {
                         Strategy.createForBiomes(biomeRegistry.asHolderIdMap()),
                         biomeRegistry.getOrThrow(Biomes.PLAINS));
 
-        // Pre-create dimension directories
         Map<String, Path> dimPaths = new LinkedHashMap<>();
         for (String dimId : dimPosToWinnerOffset.keySet()) {
             Path dp = resolveDimPath(worldPath, dimId);
@@ -200,16 +257,6 @@ public class McprWorldConverter {
             dimPaths.put(dimId, dp);
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 2 — Re-read the stream, decode and write only winner packets
-        //
-        // For non-winners we call skipFully() — zero allocation, no decode.
-        // For winners we decode once and write immediately; the object is
-        // eligible for GC as soon as the loop advances.
-        //
-        // Peak heap: one decoded chunk packet at a time regardless of how
-        // many chunks the replay contains.
-        // ═══════════════════════════════════════════════════════════════════
         sendMessage(mc, "§a[ReplayToWorld] Phase 2/2: Writing chunks...");
 
         Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
@@ -236,7 +283,7 @@ public class McprWorldConverter {
                     if (length <= 0 || length > 2_097_152) break;
 
                     if (!winnerOffsets.contains(packetStart)) {
-                        // Not a winner — skip cheaply without allocating
+
                         skipFully(dis, length);
                         bytePos += length;
                         continue;
@@ -247,7 +294,11 @@ public class McprWorldConverter {
                     bytePos += length;
 
                     if (written % 16 == 0) {
+                        checkCancelled();
                         setActionBar(mc, "Writing chunks", written, totalChunks);
+                        progressPhase = "Writing chunks";
+                        progressCurrent = written;
+                        progressTotal = totalChunks;
                     }
 
                     String dim = winnerOffsetToDim.get(packetStart);
@@ -290,13 +341,17 @@ public class McprWorldConverter {
         for (var m : entityWriters.values()) for (var w : m.values()) w.close();
 
         clearActionBar(mc);
-        sendMessage(mc, "§a[ReplayToWorld] Done! " + written + " chunks written"
+        String resultMsg = written + " chunks written"
                 + (skipped > 0 ? " (" + skipped + " skipped)" : "")
                 + " across " + dimPosToWinnerOffset.size() + " dimension(s)"
-                + " → saves/" + worldPath.getFileName());
+                + " → saves/" + worldPath.getFileName();
+        sendMessage(mc, "§a[ReplayToWorld] Done! " + resultMsg);
+        progressPhase = "Done";
+        progressCurrent = written;
+        progressTotal = totalChunks;
+        progressResultMessage = resultMsg;
+        progressDone = true;
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static String parseDimension(String toString) {
         int slash = toString.indexOf('/');
@@ -328,8 +383,6 @@ public class McprWorldConverter {
         }
     }
 
-    // ── Chunk NBT ─────────────────────────────────────────────────────────────
-
     @SuppressWarnings("unchecked")
     private static CompoundTag buildChunkNbt(
             ClientboundLevelChunkWithLightPacket packet,
@@ -347,9 +400,6 @@ public class McprWorldConverter {
 
         var rfbb = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(rawBuffer), registryAccess);
 
-        // Section range depends on dimension's world height
-        // Overworld: Y -64 to 320  -> sections -4 to 19  (24 sections)
-        // Nether/End: Y 0 to 256   -> sections  0 to 15  (16 sections)
         int minSectionY;
         int sectionCount;
         if ("minecraft:the_nether".equals(dimension) || "minecraft:the_end".equals(dimension)) {
@@ -412,8 +462,6 @@ public class McprWorldConverter {
             sections.add(sec);
         }
 
-        // Use the confirmed public API: getBlockEntitiesTagsConsumer(x, z) -> Consumer<BlockEntityTagOutput>
-        // BlockEntityTagOutput.accept(BlockPos, BlockEntityType<?>, CompoundTag)
         ListTag blockEntities = new ListTag();
         chunkData.getBlockEntitiesTagsConsumer(cx, cz).accept((blockPos, beType, nbt) -> {
             CompoundTag beTag = nbt != null ? nbt.copy() : new CompoundTag();
@@ -447,8 +495,6 @@ public class McprWorldConverter {
         chunk.put("Entities", new ListTag());
         return chunk;
     }
-
-    // ── level.dat ─────────────────────────────────────────────────────────────
 
     private static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
         CompoundTag data = new CompoundTag();
@@ -489,64 +535,18 @@ public class McprWorldConverter {
         data.put("Version", version);
 
         CompoundTag gameRules = new CompoundTag();
-        gameRules.putByte("minecraft:advance_time", (byte) 0);
-        gameRules.putByte("minecraft:advance_weather", (byte) 0);
-        gameRules.putByte("minecraft:allow_entering_nether_using_portals", (byte) 1);
-        gameRules.putByte("minecraft:block_drops", (byte) 1);
-        gameRules.putByte("minecraft:block_explosion_drop_decay", (byte) 1);
-        gameRules.putByte("minecraft:command_block_output", (byte) 1);
-        gameRules.putByte("minecraft:command_blocks_work", (byte) 1);
-        gameRules.putByte("minecraft:drowning_damage", (byte) 1);
-        gameRules.putByte("minecraft:elytra_movement_check", (byte) 1);
-        gameRules.putByte("minecraft:ender_pearls_vanish_on_death", (byte) 1);
-        gameRules.putByte("minecraft:entity_drops", (byte) 1);
-        gameRules.putByte("minecraft:fall_damage", (byte) 1);
-        gameRules.putByte("minecraft:fire_damage", (byte) 1);
-        gameRules.putInt("minecraft:fire_spread_radius_around_player", 128);
-        gameRules.putByte("minecraft:forgive_dead_players", (byte) 1);
-        gameRules.putByte("minecraft:freeze_damage", (byte) 1);
-        gameRules.putByte("minecraft:global_sound_events", (byte) 1);
-        gameRules.putByte("minecraft:immediate_respawn", (byte) 0);
-        gameRules.putByte("minecraft:keep_inventory", (byte) 0);
-        gameRules.putByte("minecraft:limited_crafting", (byte) 0);
-        gameRules.putByte("minecraft:lava_source_conversion", (byte) 0);
-        gameRules.putByte("minecraft:locator_bar", (byte) 1);
-        gameRules.putByte("minecraft:log_admin_commands", (byte) 1);
-        gameRules.putInt("minecraft:max_block_modifications", 32768);
-        gameRules.putInt("minecraft:max_command_forks", 65536);
-        gameRules.putInt("minecraft:max_command_sequence_length", 65536);
-        gameRules.putInt("minecraft:max_entity_cramming", 24);
-        gameRules.putInt("minecraft:max_snow_accumulation_height", 1);
-        gameRules.putByte("minecraft:mob_drops", (byte) 1);
-        gameRules.putByte("minecraft:mob_explosion_drop_decay", (byte) 1);
-        gameRules.putByte("minecraft:mob_griefing", (byte) 1);
-        gameRules.putByte("minecraft:natural_health_regeneration", (byte) 1);
-        gameRules.putByte("minecraft:player_movement_check", (byte) 1);
-        gameRules.putInt("minecraft:players_nether_portal_creative_delay", 0);
-        gameRules.putInt("minecraft:players_nether_portal_default_delay", 80);
-        gameRules.putInt("minecraft:players_sleeping_percentage", 100);
-        gameRules.putByte("minecraft:projectiles_can_break_blocks", (byte) 1);
-        gameRules.putByte("minecraft:pvp", (byte) 1);
-        gameRules.putByte("minecraft:raids", (byte) 1);
-        gameRules.putInt("minecraft:random_tick_speed", 3);
-        gameRules.putByte("minecraft:reduced_debug_info", (byte) 0);
-        gameRules.putInt("minecraft:respawn_radius", 10);
-        gameRules.putByte("minecraft:send_command_feedback", (byte) 1);
-        gameRules.putByte("minecraft:show_advancement_messages", (byte) 1);
-        gameRules.putByte("minecraft:show_death_messages", (byte) 1);
-        gameRules.putByte("minecraft:spawn_mobs", (byte) 0);
-        gameRules.putByte("minecraft:spawn_monsters", (byte) 0);
-        gameRules.putByte("minecraft:spawn_patrols", (byte) 0);
-        gameRules.putByte("minecraft:spawn_phantoms", (byte) 0);
-        gameRules.putByte("minecraft:spawn_wandering_traders", (byte) 0);
-        gameRules.putByte("minecraft:spawn_wardens", (byte) 0);
-        gameRules.putByte("minecraft:spawner_blocks_work", (byte) 1);
-        gameRules.putByte("minecraft:spectators_generate_chunks", (byte) 1);
-        gameRules.putByte("minecraft:spread_vines", (byte) 1);
-        gameRules.putByte("minecraft:tnt_explodes", (byte) 1);
-        gameRules.putByte("minecraft:tnt_explosion_drop_decay", (byte) 0);
-        gameRules.putByte("minecraft:universal_anger", (byte) 0);
-        gameRules.putByte("minecraft:water_source_conversion", (byte) 1);
+        for (var entry : com.pelig.replaytoworld.config.RrGameRuleConfig.load().entrySet()) {
+            String value = entry.getValue();
+            if (value.equals("true") || value.equals("false")) {
+                gameRules.putByte(entry.getKey(), (byte) (value.equals("true") ? 1 : 0));
+            } else {
+                try {
+                    gameRules.putInt(entry.getKey(), Integer.parseInt(value));
+                } catch (NumberFormatException e) {
+                    gameRules.putByte(entry.getKey(), (byte) 1);
+                }
+            }
+        }
         data.put("game_rules", gameRules);
 
         CompoundTag dataPacks = new CompoundTag();
@@ -586,7 +586,6 @@ public class McprWorldConverter {
         overworld.put("generator", gen);
         dimensions.put("minecraft:overworld", overworld);
 
-        // Nether — required for dimension teleportation to work
         CompoundTag nether = new CompoundTag();
         nether.putString("type", "minecraft:the_nether");
         CompoundTag netherGen = new CompoundTag();
@@ -600,7 +599,6 @@ public class McprWorldConverter {
         nether.put("generator", netherGen);
         dimensions.put("minecraft:the_nether", nether);
 
-        // End — required for dimension teleportation to work
         CompoundTag end = new CompoundTag();
         end.putString("type", "minecraft:the_end");
         CompoundTag endGen = new CompoundTag();
@@ -623,8 +621,6 @@ public class McprWorldConverter {
         Files.write(worldFolder.resolve("session.lock"),
                 ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array());
     }
-
-    // ── UI helpers ─────────────────────────────────────────────────────────────
 
     private static void sendMessage(Minecraft mc, String message) {
         ReplayToWorldMod.LOGGER.info(message);
