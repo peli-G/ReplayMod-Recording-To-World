@@ -143,7 +143,7 @@ public abstract class MixinTitleScreen extends Screen {
     @Unique
     private void rr$onButtonPressed() {
         com.pelig.replaytoworld.ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Title screen button pressed");
-        com.pelig.replaytoworld.RrConvertAction.openThemedReplayViewer();
+        com.pelig.replaytoworld.screen.RrReplayViewers.openNormal();
     }
 
     @Unique

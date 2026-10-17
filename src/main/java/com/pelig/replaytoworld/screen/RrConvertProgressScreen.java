@@ -40,8 +40,21 @@ public class RrConvertProgressScreen extends Screen {
 
         String worldName = McprWorldConverter.progressWorldName.isEmpty()
                 ? "Replay" : McprWorldConverter.progressWorldName;
+        int recordingCount = McprWorldConverter.progressRecordingCount;
+
         guiGraphics.drawCenteredString(this.font,
-                "Converting Replay '" + worldName + "'", this.width / 2, 20, 0xFFFFFFFF);
+                recordingCount > 1
+                        ? "Combining " + recordingCount + " Replays into '" + worldName + "'"
+                        : "Converting Replay '" + worldName + "'",
+                this.width / 2, 20, 0xFFFFFFFF);
+
+        if (recordingCount > 1) {
+            int currentRecording = Math.max(1, Math.min(McprWorldConverter.progressRecording, recordingCount));
+            String name = McprWorldConverter.progressRecordingName;
+            String line = "Recording " + currentRecording + " / " + recordingCount
+                    + (name.isEmpty() ? "" : ": " + name);
+            guiGraphics.drawCenteredString(this.font, line, this.width / 2, 34, 0xFF909090);
+        }
 
         int current = McprWorldConverter.progressCurrent;
         int total = Math.max(McprWorldConverter.progressTotal, 1);
