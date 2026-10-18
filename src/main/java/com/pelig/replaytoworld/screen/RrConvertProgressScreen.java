@@ -10,6 +10,7 @@ public class RrConvertProgressScreen extends Screen {
 
     private final Screen parent;
     private Button actionButton;
+    private Button backgroundButton;
 
     public RrConvertProgressScreen(Screen parent) {
         super(Component.literal("Converting Replay"));
@@ -18,20 +19,37 @@ public class RrConvertProgressScreen extends Screen {
 
     @Override
     protected void init() {
+        RrBackgroundOverlay.ensureRegistered();
+
+        this.backgroundButton = this.addRenderableWidget(Button.builder(Component.literal("Keep Converting in Background"), btn -> {
+            RrBackgroundOverlay.markBackgrounded();
+            this.minecraft.setScreen(this.parent);
+        }).bounds(this.width / 2 - 154, this.height / 4 + 150, 180, 20).build());
+
         this.actionButton = this.addRenderableWidget(Button.builder(Component.literal("Cancel"), btn -> {
             if (!McprWorldConverter.progressDone) {
                 McprWorldConverter.cancel();
             }
             this.minecraft.setScreen(this.parent);
-        }).bounds(this.width / 2 - 100, this.height / 4 + 150, 200, 20).build());
+        }).bounds(this.width / 2 + 30, this.height / 4 + 150, 124, 20).build());
+
+        this.updateButtons();
+    }
+
+    private void updateButtons() {
+        boolean done = McprWorldConverter.progressDone;
+        if (this.actionButton != null) {
+            this.actionButton.setMessage(Component.literal(done ? "Close" : "Cancel"));
+        }
+        if (this.backgroundButton != null) {
+            this.backgroundButton.active = !done;
+        }
     }
 
     @Override
     public void tick() {
         super.tick();
-        if (this.actionButton != null) {
-            this.actionButton.setMessage(Component.literal(McprWorldConverter.progressDone ? "Close" : "Cancel"));
-        }
+        this.updateButtons();
     }
 
     @Override
@@ -70,6 +88,16 @@ public class RrConvertProgressScreen extends Screen {
                 : McprWorldConverter.progressDone ? 0xFF55FF55 : 0xFFA0A0A0;
 
         guiGraphics.drawCenteredString(this.font, phaseLabel, this.width / 2, 50, phaseColor);
+
+        if (McprWorldConverter.progressThreads > 1 && !McprWorldConverter.progressDone) {
+            guiGraphics.drawCenteredString(this.font, "Fast convert: using " + McprWorldConverter.progressThreads + " CPU threads",
+                    this.width / 2, 64, 0xFF55FFFF);
+        }
+        if (!McprWorldConverter.progressDone) {
+            guiGraphics.drawCenteredString(this.font,
+                    "You can use other menus while this runs - progress shows in the corner",
+                    this.width / 2, this.height / 4 + 138, 0xFF808080);
+        }
 
         int barWidth = 200;
         int barX = this.width / 2 - barWidth / 2;

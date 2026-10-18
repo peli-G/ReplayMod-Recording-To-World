@@ -27,6 +27,14 @@ public final class RrConversionLauncher {
     }
 
     private static void start(Minecraft minecraft, Screen previousScreen, List<Path> recordings, Path targetWorld) {
+        RrBackgroundOverlay.ensureRegistered();
+        if (McprWorldConverter.running) {
+            // One conversion at a time - show the one that's already going.
+            minecraft.setScreen(new RrConvertProgressScreen(previousScreen));
+            return;
+        }
+        RrBackgroundOverlay.resetForNewConversion();
+
         List<Path> paths = new ArrayList<>(recordings);
         if (paths.isEmpty()) {
             ReplayToWorldMod.LOGGER.warn("[RrToWorld] Convert requested with no recordings selected");
