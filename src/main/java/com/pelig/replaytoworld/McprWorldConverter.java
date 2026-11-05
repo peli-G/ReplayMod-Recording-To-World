@@ -25,6 +25,7 @@ import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.Strategy;
 import net.minecraft.world.level.chunk.PalettedContainerRO;
 import net.minecraft.world.level.ChunkPos;
+import com.pelig.replaytoworld.config.RrSettings;
 import com.pelig.replaytoworld.mixin.ClientboundLevelChunkPacketDataAccessor;
 
 import java.io.*;
@@ -54,6 +55,10 @@ public class McprWorldConverter {
     public static volatile String progressRecordingName = "";
 
     public static volatile int progressThreads = 1;
+
+    /** World name typed on the "Select an option" screen (blank or null uses the recording's name). */
+    public static volatile String requestedWorldName = null;
+    private static volatile String activeWorldName = null;
 
     public static volatile Path progressWorldPath = null;
     public static volatile Path progressStagingPath = null;
@@ -107,6 +112,9 @@ public class McprWorldConverter {
         progressRecordingCount = inputs.size();
         progressRecordingName = "";
         progressThreads = 1;
+        String typedName = requestedWorldName;
+        requestedWorldName = null;
+        activeWorldName = importMode || typedName == null || typedName.isBlank() ? null : typedName.trim();
         Thread t = new Thread(() -> {
             try {
                 ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Conversion thread started for {}", inputs);
@@ -151,10 +159,29 @@ public class McprWorldConverter {
         Path world = progressWorldPath;
         if (importMode || world == null || Files.exists(world.resolve("level.dat"))) return;
         try {
-            writeLevelDat(world, world.getFileName().toString());
+            writeLevelDat(world, levelNameFor(world));
         } catch (Exception ex) {
             ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] Couldn't write level.dat for the partial world: {}", ex.getMessage());
         }
+    }
+
+    /** Turns a typed world name into a safe folder name, or null if nothing usable is left. */
+    private static String safeFolderName(String typed) {
+        if (typed == null) return null;
+        String name = typed.trim()
+                .replaceAll("[\\\\/:*?\"<>|]", "_")
+                .replaceAll("[\\p{Cntrl}]", "")
+                .replaceAll("[. ]+$", "");
+        if (name.length() > 64) name = name.substring(0, 64).trim();
+        if (name.isEmpty() || name.equals(".") || name.equals("..")) return null;
+        if (name.matches("(?i)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\\..*)?")) name = "_" + name;
+        return name;
+    }
+
+    /** The name shown in Singleplayer: the typed name if there is one, otherwise the folder name. */
+    private static String levelNameFor(Path worldFolder) {
+        String typed = activeWorldName;
+        return typed != null && !typed.isBlank() ? typed : worldFolder.getFileName().toString();
     }
 
     private static void cleanupAfterCancel(Minecraft mc, boolean importMode) {
@@ -192,7 +219,7 @@ public class McprWorldConverter {
                 if (staged.getFileName().toString().endsWith(".mca")) stagedFiles.add(staged);
             }
         }
-        // Each region file is independent, so they're merged in parallel (Faster Convert).
+
         ExecutorService pool = newWorkerPool(workerThreadCount());
         try {
             List<Future<?>> jobs = new ArrayList<>();
@@ -246,31 +273,47 @@ public class McprWorldConverter {
     private record EncodedChunk(ChunkPos pos, boolean hasBlocks, byte[] chunkEntry, byte[] entityEntry,
                                 String decodeError, String encodeError) {}
 
-    /** Write-phase state; only touched from the conversion thread. */
+    /** Write-phase state. Counters are only touched from the conversion thread; chunk states are read by the reader too. */
     private static final class WriteContext {
         final Map<String, Path> dimPaths;
         final Map<String, Map<Long, RegionFileWriter>> regionWriters;
         final Map<String, Map<Long, RegionFileWriter>> entityWriters;
-        final Map<String, Map<Long, Boolean>> placed;
+        /** dimension -> chunk position -> 1 (written, air only) or 2 (written with real blocks: final). */
+        final Map<String, java.util.concurrent.ConcurrentHashMap<Long, Byte>> state = new java.util.concurrent.ConcurrentHashMap<>();
+        final RrChunkTranslator.Session translator;
+        final boolean lz4;
         final int[] writtenPerRecording;
         final int[] skippedPerRecording;
-        int written, skipped, keptTerrain;
+        final java.util.concurrent.atomic.AtomicLong olderCopiesSkipped = new java.util.concurrent.atomic.AtomicLong();
+        int written, skipped;
 
         WriteContext(int recordingCount, Map<String, Path> dimPaths,
                      Map<String, Map<Long, RegionFileWriter>> regionWriters,
                      Map<String, Map<Long, RegionFileWriter>> entityWriters,
-                     Map<String, Map<Long, Boolean>> placed) {
+                     RrChunkTranslator.Session translator, boolean lz4) {
             this.dimPaths = dimPaths;
             this.regionWriters = regionWriters;
             this.entityWriters = entityWriters;
-            this.placed = placed;
+            this.translator = translator;
+            this.lz4 = lz4;
             this.writtenPerRecording = new int[recordingCount];
             this.skippedPerRecording = new int[recordingCount];
+        }
+
+        java.util.concurrent.ConcurrentHashMap<Long, Byte> stateFor(String dim) {
+            return this.state.computeIfAbsent(dim, k -> new java.util.concurrent.ConcurrentHashMap<>());
+        }
+
+        boolean isFinal(String dim, long posKey) {
+            var m = this.state.get(dim);
+            if (m == null) return false;
+            Byte b = m.get(posKey);
+            return b != null && b == 2;
         }
     }
 
     private static EncodedChunk encodeChunk(
-            PendingChunk pc,
+            PendingChunk pc, WriteContext ctx,
             net.minecraft.network.codec.StreamCodec<io.netty.buffer.ByteBuf, net.minecraft.network.protocol.Packet<? super net.minecraft.network.protocol.game.ClientGamePacketListener>> codec,
             RegistryAccess registryAccess,
             com.mojang.serialization.DynamicOps<Tag> ops,
@@ -282,14 +325,48 @@ public class McprWorldConverter {
             var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(pc.data()), registryAccess);
             var pkt = codec.decode(buf);
             if (!(pkt instanceof ClientboundLevelChunkWithLightPacket cp)) {
-                return new EncodedChunk(null, false, null, null, null, null); // not a chunk packet
+                return new EncodedChunk(null, false, null, null, null, null);
             }
             pos = new ChunkPos(cp.getX(), cp.getZ());
-            int[] blockCount = new int[1];
-            CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
-            hasBlocks = blockCount[0] > 0;
-            byte[] chunkEntry = RegionFileWriter.encode(pos, chunkNbt);
-            byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos));
+
+            byte[] chunkNbtBytes = null;
+            RrChunkTranslator.Session tr = ctx.translator;
+            if (tr.enabled) {
+                try {
+                    RrChunkTranslator.Result direct = RrChunkTranslator.translate(tr, cp, pc.dim());
+                    if (tr.shouldCheck()) {
+                        int[] blockCount = new int[1];
+                        CompoundTag original = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
+                        byte[] originalBytes = RrChunkTranslator.nbtBytes(original);
+                        String diff = RrNbtIO.compareChunks(direct.nbt(), originalBytes);
+                        if (diff != null || direct.hasBlocks() != (blockCount[0] > 0)) {
+                            tr.disable("chunk " + pos.x + "," + pos.z + " differed: "
+                                    + (diff != null ? diff : "block count"));
+                            chunkNbtBytes = originalBytes;
+                            hasBlocks = blockCount[0] > 0;
+                        } else {
+                            tr.checkPassed();
+                        }
+                    }
+                    if (chunkNbtBytes == null) {
+                        chunkNbtBytes = direct.nbt();
+                        hasBlocks = direct.hasBlocks();
+                        tr.noteSuccess();
+                    }
+                } catch (Exception e) {
+                    tr.noteFailure(String.valueOf(e.getMessage()));
+                    chunkNbtBytes = null;
+                }
+            }
+            if (chunkNbtBytes == null) {
+                int[] blockCount = new int[1];
+                CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
+                hasBlocks = blockCount[0] > 0;
+                chunkNbtBytes = RrChunkTranslator.nbtBytes(chunkNbt);
+            }
+
+            byte[] chunkEntry = RegionFileWriter.encodeRaw(pos, chunkNbtBytes, ctx.lz4);
+            byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos), ctx.lz4);
             return new EncodedChunk(pos, hasBlocks, chunkEntry, entityEntry, null, null);
         } catch (Exception e) {
             String msg = String.valueOf(e.getMessage());
@@ -310,10 +387,9 @@ public class McprWorldConverter {
 
         List<Future<EncodedChunk>> futures = new ArrayList<>(batch.size());
         for (PendingChunk pc : batch) {
-            futures.add(pool.submit(() -> encodeChunk(pc, codec, registryAccess, ops, blockCodec, biomeCodec)));
+            futures.add(pool.submit(() -> encodeChunk(pc, ctx, codec, registryAccess, ops, blockCodec, biomeCodec)));
         }
 
-        // Apply results strictly in recording order (same rules as before).
         for (int i = 0; i < batch.size(); i++) {
             PendingChunk pc = batch.get(i);
             EncodedChunk res;
@@ -334,15 +410,15 @@ public class McprWorldConverter {
                 ctx.skippedPerRecording[r]++;
                 continue;
             }
-            if (res.pos() == null) continue; // not a chunk packet
+            if (res.pos() == null) continue;
 
             ChunkPos pos = res.pos();
-            Map<Long, Boolean> placedInDim = ctx.placed.computeIfAbsent(dim, k -> new HashMap<>());
+            var states = ctx.stateFor(dim);
             long posKey = ChunkPos.asLong(pos.x, pos.z);
-            Boolean alreadyPlaced = placedInDim.get(posKey);
+            Byte state = states.get(posKey);
 
-            if (alreadyPlaced != null && !res.hasBlocks()) {
-                ctx.keptTerrain++;
+            if (state != null && state == 2) {
+                ctx.olderCopiesSkipped.incrementAndGet();
                 continue;
             }
 
@@ -362,8 +438,8 @@ public class McprWorldConverter {
                             catch (Exception e) { throw new RuntimeException(e); }
                         }).writeEntry(pos, res.entityEntry());
 
-                placedInDim.put(posKey, res.hasBlocks() || Boolean.TRUE.equals(alreadyPlaced));
-                if (alreadyPlaced == null) ctx.written++;
+                states.put(posKey, res.hasBlocks() ? (byte) 2 : (byte) 1);
+                if (state == null) ctx.written++;
                 ctx.writtenPerRecording[r]++;
             } catch (Exception e) {
                 ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] Skipped {} chunk at offset {} (recording {}): {}",
@@ -402,6 +478,28 @@ public class McprWorldConverter {
             return;
         }
 
+        if (existingWorldTarget != null && RrSettings.isSkipAdded()) {
+            Set<String> alreadyAdded = RrSources.read(existingWorldTarget);
+            List<String> skippedNames = new ArrayList<>();
+            inputs.removeIf(p -> {
+                boolean known = alreadyAdded.contains(RrSources.key(p));
+                if (known) skippedNames.add(p.getFileName().toString());
+                return known;
+            });
+            if (!skippedNames.isEmpty()) {
+                sendMessage(mc, "§7[ReplayToWorld] Skipping " + skippedNames.size()
+                        + " recording(s) already in this world: " + String.join(", ", skippedNames));
+            }
+            if (inputs.isEmpty()) {
+                String msg = "Nothing new to add - every recording is already in " + existingWorldTarget.getFileName();
+                sendMessage(mc, "§a[ReplayToWorld] " + msg);
+                progressWorldName = existingWorldTarget.getFileName().toString();
+                progressResultMessage = msg;
+                progressDone = true;
+                return;
+            }
+        }
+
         final int recordingCount = inputs.size();
         progressRecordingCount = recordingCount;
 
@@ -422,12 +520,29 @@ public class McprWorldConverter {
         sendMessage(mc, "§a[ReplayToWorld] Phase 1/2: Scanning packets...");
 
         List<Map<String, Map<Long, Long>>> scans = new ArrayList<>();
+        int reusedScans = 0;
         for (int r = 0; r < recordingCount; r++) {
             checkCancelled();
             progressRecording = r + 1;
-            progressRecordingName = inputs.get(r).getFileName().toString();
-            scans.add(scanRecording(inputs.get(r), r, recordingCount,
-                    gamePacketCodec, registryAccess, mc));
+            Path recording = inputs.get(r);
+            progressRecordingName = recording.getFileName().toString();
+
+            Map<String, Map<Long, Long>> saved = RrScanCache.load(recording);
+            if (saved != null) {
+                setActionBar(mc, "Using saved scan" + (recordingCount > 1 ? " [" + (r + 1) + "/" + recordingCount + "]" : ""),
+                        r + 1, recordingCount);
+                scans.add(saved);
+                reusedScans++;
+                continue;
+            }
+
+            Map<String, Map<Long, Long>> scan = scanRecording(recording, r, recordingCount,
+                    gamePacketCodec, registryAccess, mc);
+            scans.add(scan);
+            if (!scan.isEmpty()) RrScanCache.save(recording, scan);
+        }
+        if (reusedScans > 0) {
+            sendMessage(mc, "§7[ReplayToWorld] Reused saved scans for " + reusedScans + " recording(s) - no rescanning needed.");
         }
 
         Map<String, Set<Long>> merged = new LinkedHashMap<>();
@@ -458,16 +573,19 @@ public class McprWorldConverter {
             return;
         }
 
-        // For every recording: byte offset (inside recording.tmcpr) of each chunk packet to write -> dimension.
         List<Map<Long, String>> candidatesPerRecording = new ArrayList<>();
+        List<Map<Long, Long>> positionsPerRecording = new ArrayList<>();
         for (int r = 0; r < recordingCount; r++) {
             Map<Long, String> byOffset = new HashMap<>();
+            Map<Long, Long> posByOffset = new HashMap<>();
             for (var dimEntry : scans.get(r).entrySet()) {
-                for (long offset : dimEntry.getValue().values()) {
-                    byOffset.put(offset, dimEntry.getKey());
+                for (var e : dimEntry.getValue().entrySet()) {
+                    byOffset.put(e.getValue(), dimEntry.getKey());
+                    posByOffset.put(e.getValue(), e.getKey());
                 }
             }
             candidatesPerRecording.add(byOffset);
+            positionsPerRecording.add(posByOffset);
         }
 
         if (recordingCount > 1) {
@@ -527,6 +645,11 @@ public class McprWorldConverter {
             if (recordingCount > 1) {
                 baseName = baseName + " +" + (recordingCount - 1);
             }
+            String customFolder = safeFolderName(activeWorldName);
+            if (customFolder != null) {
+                baseName = customFolder;
+                sendMessage(mc, "§7[ReplayToWorld] World name: " + activeWorldName);
+            }
             Path savesDir = mc.gameDirectory.toPath().resolve("saves");
             worldPath = savesDir.resolve(baseName);
             if (Files.exists(worldPath)) {
@@ -537,8 +660,7 @@ public class McprWorldConverter {
             Files.createDirectories(worldPath);
             progressWorldPath = worldPath;
             progressWorldName = worldPath.getFileName().toString();
-            // level.dat is written once all chunks are in (see below), so the half-made world
-            // doesn't show up in Singleplayer while it's still converting.
+
         }
 
         var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
@@ -566,27 +688,28 @@ public class McprWorldConverter {
 
         Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
         Map<String, Map<Long, RegionFileWriter>> entityWriters = new HashMap<>();
-        int written = 0, skipped = 0, keptTerrain = 0;
+        int written = 0, skipped = 0;
         int[] writtenPerRecording = new int[recordingCount];
         int[] skippedPerRecording = new int[recordingCount];
         int processed = 0;
 
-        Map<String, Map<Long, Boolean>> placed = new HashMap<>();
-
-        // Faster Convert: decoding, building and compressing chunks runs on several threads;
-        // the results are then written to the region files in the original order, so overlap
-        // rules (later recordings win, air-only copies don't erase terrain) are unchanged.
         int threads = workerThreadCount();
         progressThreads = threads;
         ExecutorService pool = newWorkerPool(threads);
-        WriteContext ctx = new WriteContext(recordingCount, dimPaths, regionWriters, entityWriters, placed);
-        sendMessage(mc, "§7[ReplayToWorld] Fast convert: using " + threads + " CPU thread(s).");
+        boolean lz4 = RrSettings.isLz4() && RegionFileWriter.lz4Available();
+        RrChunkTranslator.Session translator = new RrChunkTranslator.Session(
+                registryAccess, ops, blockCodec, biomeCodec, DATA_VERSION);
+        WriteContext ctx = new WriteContext(recordingCount, dimPaths, regionWriters, entityWriters, translator, lz4);
+        sendMessage(mc, "§7[ReplayToWorld] Fast convert: " + threads + " CPU thread(s)"
+                + (lz4 ? ", LZ4 compression" : "")
+                + (recordingCount > 1 ? ", newest recording first" : "") + ".");
 
         try {
-            for (int r = 0; r < recordingCount; r++) {
+            for (int r = recordingCount - 1; r >= 0; r--) {
                 checkCancelled();
                 Map<Long, String> winnerOffsetToDim = candidatesPerRecording.get(r);
                 if (winnerOffsetToDim.isEmpty()) continue;
+                Map<Long, Long> posByOffset = positionsPerRecording.get(r);
 
                 progressRecording = r + 1;
                 progressRecordingName = inputs.get(r).getFileName().toString();
@@ -601,7 +724,7 @@ public class McprWorldConverter {
                         long bytePos = 0;
                         while (true) {
                             long packetStart = bytePos;
-                            try { is.readInt(); } catch (EOFException e) { break; }   // timestamp
+                            try { is.readInt(); } catch (EOFException e) { break; }
                             int size;
                             try { size = is.readInt(); } catch (EOFException e) { break; }
                             bytePos += 8;
@@ -621,6 +744,14 @@ public class McprWorldConverter {
                                 setActionBar(mc, "Writing " + shortDim + tag, processed, scannedTotal);
                             }
                             processed++;
+
+                            Long posKey = posByOffset.get(packetStart);
+                            if (posKey != null && ctx.isFinal(dim, posKey)) {
+                                skipFully(is, size);
+                                bytePos += size;
+                                ctx.olderCopiesSkipped.incrementAndGet();
+                                continue;
+                            }
 
                             byte[] data = new byte[size];
                             try { is.readFully(data); } catch (EOFException e) { break; }
@@ -645,7 +776,6 @@ public class McprWorldConverter {
 
         written = ctx.written;
         skipped = ctx.skipped;
-        keptTerrain = ctx.keptTerrain;
         writtenPerRecording = ctx.writtenPerRecording;
         skippedPerRecording = ctx.skippedPerRecording;
 
@@ -675,15 +805,23 @@ public class McprWorldConverter {
             }
         }
 
-        if (keptTerrain > 0) {
-            sendMessage(mc, "§7[ReplayToWorld] " + keptTerrain
-                    + " air-only copies skipped so existing terrain wasn't erased.");
-            ReplayToWorldMod.LOGGER.info("[ReplayToWorld] {} air-only chunk copies skipped", keptTerrain);
+        if (ctx.olderCopiesSkipped.get() > 0) {
+            sendMessage(mc, "§7[ReplayToWorld] " + ctx.olderCopiesSkipped.get()
+                    + " older chunk copies skipped without decoding (a newer recording already had them).");
+        }
+        if (translator.enabled) {
+            sendMessage(mc, "§7[ReplayToWorld] Direct chunk translation: " + translator.translated.get() + " chunks ("
+                    + translator.checksPassed.get() + " double-checked against the old method"
+                    + (translator.fellBack.get() > 0 ? ", " + translator.fellBack.get() + " done the old way" : "") + ").");
+        } else {
+            sendMessage(mc, "§e[ReplayToWorld] Direct chunk translation switched itself off (" + translator.disabledReason
+                    + ") - those chunks were converted the old, safe way.");
         }
 
         if (!importMode) {
-            writeLevelDat(worldPath, worldPath.getFileName().toString());
+            writeLevelDat(worldPath, levelNameFor(worldPath));
         }
+        RrSources.append(worldPath, inputs);
 
         String resultMsg = written + " chunks written"
                 + (skipped > 0 ? " (" + skipped + " skipped)" : "")
@@ -735,7 +873,7 @@ public class McprWorldConverter {
                 long bytePos = 0;
                 while (true) {
                     long packetStart = bytePos;
-                    try { dis.readInt(); } catch (EOFException e) { break; }   // timestamp
+                    try { dis.readInt(); } catch (EOFException e) { break; }
                     int length;
                     try { length = dis.readInt(); } catch (EOFException e) { break; }
                     bytePos += 8;
@@ -763,9 +901,6 @@ public class McprWorldConverter {
                         progressPhase = "Scanning packets" + tag;
                     }
 
-                    // Faster Convert: a packet id always means the same packet type, so types already
-                    // seen that aren't chunks/login/respawn are skipped instead of fully decoded, and
-                    // chunk packets just have their X/Z read from the start of the packet.
                     int packetId = readVarIntBytes(data);
                     if (packetId >= 0 && packetId < notInteresting.length && notInteresting[packetId]) {
                         continue;
@@ -796,7 +931,7 @@ public class McprWorldConverter {
                             notInteresting[packetId] = true;
                         }
                     } catch (Exception ignored) {
-                        // Non-play packets (login/configuration phase) don't decode as game packets - that's fine.
+
                     }
                 }
             }

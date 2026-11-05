@@ -106,6 +106,7 @@ public class RrConvertAction {
 
     private static void startWithRegistryAccess(File replayFile, RegistryAccess registryAccess,
                                                   Minecraft minecraft, Screen previousScreen) {
+        McprWorldConverter.requestedWorldName = null;
         boolean started = McprWorldConverter.start(replayFile.toPath(), registryAccess, minecraft);
         ReplayToWorldMod.LOGGER.info("[ReplayToWorld] McprWorldConverter.start() returned: {}", started);
         if (started) {
