@@ -8,6 +8,8 @@ The Mod Converts:
  - Entities
  - Biomes
 
+Download on [Github](https://github.com/peli-G/ReplayMod-Recording-To-World) & [Modrinth](https://modrinth.com/mod/fbr-to-world).
+
 # Fabric API
 Fabric API is required for this mod to work. You can download it [here](https://modrinth.com/mod/fabric-api).
 
