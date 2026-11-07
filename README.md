@@ -8,7 +8,7 @@ The Mod Converts:
  - Entities
  - Biomes
 
-Download on [Github](https://github.com/peli-G/ReplayMod-Recording-To-World) & [Modrinth](https://modrinth.com/mod/fbr-to-world).
+Download on [Github](https://github.com/peli-G/ReplayMod-Recording-To-World) & [Modrinth](https://modrinth.com/mod/replaymod-recording-to-world).
 
 > [!NOTE]
 > This project contains AI-generated code. See [AI-USAGE.md](AI-USAGE.md) for more information.
