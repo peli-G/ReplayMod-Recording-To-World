@@ -58,6 +58,7 @@ public class McprWorldConverter {
 
     /** World name typed on the "Select an option" screen (blank or null uses the recording's name). */
     public static volatile String requestedWorldName = null;
+    private static volatile RrStartSpawn.StartPos pendingStart = null;
     private static volatile String activeWorldName = null;
 
     public static volatile Path progressWorldPath = null;
@@ -519,6 +520,17 @@ public class McprWorldConverter {
 
         sendMessage(mc, "§a[ReplayToWorld] Phase 1/2: Scanning packets...");
 
+        pendingStart = null;
+        if (existingWorldTarget == null && !mcprPaths.isEmpty()) {
+            pendingStart = RrStartSpawn.read(inputs.get(0), gamePacketCodec, registryAccess);
+            if (pendingStart != null) {
+                ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Recording start: {} {} {} in {}",
+                        pendingStart.x(), pendingStart.y(), pendingStart.z(), pendingStart.dimension());
+            } else {
+                ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] Couldn't find the recording's start position in {}",
+                        inputs.get(0).getFileName());
+            }
+        }
         List<Map<String, Map<Long, Long>>> scans = new ArrayList<>();
         int reusedScans = 0;
         for (int r = 0; r < recordingCount; r++) {
@@ -820,6 +832,13 @@ public class McprWorldConverter {
 
         if (!importMode) {
             writeLevelDat(worldPath, levelNameFor(worldPath));
+            RrStartSpawn.StartPos start = usableStart();
+            if (start != null) {
+                String dimName = start.dimension().substring(start.dimension().indexOf(':') + 1);
+                sendMessage(mc, "§a[ReplayToWorld] Spawn set to where the recording started: §f"
+                        + (int) Math.floor(start.x()) + ", " + (int) Math.floor(start.y()) + ", "
+                        + (int) Math.floor(start.z()) + " §7(" + dimName + ")");
+            }
         }
         RrSources.append(worldPath, inputs);
 
@@ -965,7 +984,7 @@ public class McprWorldConverter {
              | ((b[off + 2] & 0xff) << 8)  |  (b[off + 3] & 0xff);
     }
 
-    private static String parseDimension(String resourceKeyString) {
+    static String parseDimension(String resourceKeyString) {
         int slash = resourceKeyString.indexOf('/');
         if (slash >= 0) return resourceKeyString.substring(slash + 2, resourceKeyString.length() - 1).trim();
         return "minecraft:overworld";
@@ -1118,6 +1137,17 @@ public class McprWorldConverter {
         return chunk;
     }
 
+    private static RrStartSpawn.StartPos usableStart() {
+        RrStartSpawn.StartPos start = pendingStart;
+        if (start == null) return null;
+        if (!RrStartSpawn.isVanillaDimension(start.dimension())) {
+            ReplayToWorldMod.LOGGER.warn("[ReplayToWorld] Recording started in custom dimension {} - keeping default spawn",
+                    start.dimension());
+            return null;
+        }
+        return start;
+    }
+
     private static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
         CompoundTag data = new CompoundTag();
         data.putInt("DataVersion",  DATA_VERSION);
@@ -1142,12 +1172,32 @@ public class McprWorldConverter {
         data.putInt("WanderingTraderSpawnChance", 25);
         data.putInt("WanderingTraderSpawnDelay",  24000);
 
+        RrStartSpawn.StartPos start = usableStart();
         CompoundTag spawn = new CompoundTag();
-        spawn.put("pos", new net.minecraft.nbt.IntArrayTag(new int[]{8, -64, 8}));
-        spawn.putFloat("pitch", 0.0f);
-        spawn.putFloat("yaw",   0.0f);
-        spawn.putString("dimension", "minecraft:overworld");
+        int[] spawnPos = start != null
+                ? new int[]{(int) Math.floor(start.x()), (int) Math.floor(start.y()), (int) Math.floor(start.z())}
+                : new int[]{8, -64, 8};
+        spawn.put("pos", new net.minecraft.nbt.IntArrayTag(spawnPos));
+        spawn.putFloat("pitch", start != null ? start.pitch() : 0.0f);
+        spawn.putFloat("yaw",   start != null ? start.yaw() : 0.0f);
+        spawn.putString("dimension", start != null ? start.dimension() : "minecraft:overworld");
         data.put("spawn", spawn);
+
+        if (start != null) {
+            CompoundTag player = new CompoundTag();
+            ListTag playerPos = new ListTag();
+            playerPos.add(DoubleTag.valueOf(start.x()));
+            playerPos.add(DoubleTag.valueOf(start.y()));
+            playerPos.add(DoubleTag.valueOf(start.z()));
+            player.put("Pos", playerPos);
+            ListTag playerRotation = new ListTag();
+            playerRotation.add(FloatTag.valueOf(start.yaw()));
+            playerRotation.add(FloatTag.valueOf(start.pitch()));
+            player.put("Rotation", playerRotation);
+            player.putString("Dimension", start.dimension());
+            player.putInt("playerGameType", 1);
+            data.put("Player", player);
+        }
 
         CompoundTag version = new CompoundTag();
         version.putString("Name",   VERSION_NAME);
