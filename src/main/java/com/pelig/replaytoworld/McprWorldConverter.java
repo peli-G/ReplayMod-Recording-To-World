@@ -333,10 +333,15 @@ public class McprWorldConverter {
         try {
             var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(pc.data()), registryAccess);
             var pkt = codec.decode(buf);
+            RrDeveloperMode.log("Decoded packet at offset {} in {}: {} ({} bytes, {} left unread)",
+                    pc.offset(), pc.dim(), pkt.getClass().getSimpleName(), pc.data().length, buf.readableBytes());
             if (!(pkt instanceof ClientboundLevelChunkWithLightPacket cp)) {
                 return new EncodedChunk(null, false, null, null, null, null);
             }
             pos = new ChunkPos(cp.getX(), cp.getZ());
+            RrDeveloperMode.log("Chunk {},{} in {} (offset {}): light sections sky={} block={}",
+                    pos.x, pos.z, pc.dim(), pc.offset(),
+                    cp.getLightData().getSkyYMask().cardinality(), cp.getLightData().getBlockYMask().cardinality());
 
             byte[] chunkNbtBytes = null;
             RrChunkTranslator.Session tr = ctx.translator;
@@ -348,6 +353,8 @@ public class McprWorldConverter {
                         CompoundTag original = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
                         byte[] originalBytes = RrChunkTranslator.nbtBytes(original);
                         String diff = RrNbtIO.compareChunks(direct.nbt(), originalBytes);
+                        RrDeveloperMode.log("Chunk {},{}: verified direct translation against the old method: {}",
+                                pos.x, pos.z, diff == null ? "identical" : diff);
                         if (diff != null || direct.hasBlocks() != (blockCount[0] > 0)) {
                             tr.disable("chunk " + pos.x + "," + pos.z + " differed: "
                                     + (diff != null ? diff : "block count"));
@@ -363,11 +370,13 @@ public class McprWorldConverter {
                         tr.noteSuccess();
                     }
                 } catch (Exception e) {
+                    RrDeveloperMode.error("Direct translation failed for chunk " + pos.x + "," + pos.z + ", falling back to the old method", e);
                     tr.noteFailure(String.valueOf(e.getMessage()));
                     chunkNbtBytes = null;
                 }
             }
             if (chunkNbtBytes == null) {
+                RrDeveloperMode.log("Chunk {},{}: using the old build method", pos.x, pos.z);
                 int[] blockCount = new int[1];
                 CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
                 hasBlocks = blockCount[0] > 0;
@@ -376,8 +385,11 @@ public class McprWorldConverter {
 
             byte[] chunkEntry = RegionFileWriter.encodeRaw(pos, chunkNbtBytes, ctx.lz4);
             byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos), ctx.lz4);
+            RrDeveloperMode.log("Chunk {},{} encoded: nbt {} bytes, region entry {} bytes, entity entry {} bytes, hasBlocks={}",
+                    pos.x, pos.z, chunkNbtBytes.length, chunkEntry.length, entityEntry.length, hasBlocks);
             return new EncodedChunk(pos, hasBlocks, chunkEntry, entityEntry, null, null);
         } catch (Exception e) {
+            RrDeveloperMode.error("Failed to decode or encode packet at offset " + pc.offset() + " in " + pc.dim(), e);
             String msg = String.valueOf(e.getMessage());
             return pos == null
                     ? new EncodedChunk(null, false, null, null, msg, null)
@@ -420,7 +432,10 @@ public class McprWorldConverter {
                 ctx.skippedPerRecording[r]++;
                 continue;
             }
-            if (res.pos() == null) continue;
+            if (res.pos() == null) {
+                RrDeveloperMode.log("Packet at offset {} in {} is not a chunk packet, ignored", pc.offset(), dim);
+                continue;
+            }
 
             ChunkPos pos = res.pos();
             var states = ctx.stateFor(dim);
@@ -428,6 +443,7 @@ public class McprWorldConverter {
             Byte state = states.get(posKey);
 
             if (state != null && state == 2) {
+                RrDeveloperMode.log("Chunk {},{} in {}: already written with blocks from a newer copy, older offset {} dropped", pos.x, pos.z, dim, pc.offset());
                 ctx.olderCopiesSkipped.incrementAndGet();
                 continue;
             }
@@ -448,6 +464,8 @@ public class McprWorldConverter {
                             catch (Exception e) { throw new RuntimeException(e); }
                         }).writeEntry(pos, res.entityEntry());
 
+                RrDeveloperMode.log("Wrote chunk {},{} in {} to {} (previous state {}, hasBlocks={})",
+                        pos.x, pos.z, dim, regionName, state, res.hasBlocks());
                 states.put(posKey, res.hasBlocks() ? (byte) 2 : (byte) 1);
                 if (state == null) ctx.written++;
                 ctx.writtenPerRecording[r]++;
@@ -757,6 +775,7 @@ public class McprWorldConverter {
                             String dim = winnerOffsetToDim.get(packetStart);
 
                             if (dim == null) {
+                                RrDeveloperMode.log("Packet at offset {}: {} bytes, not a winning chunk, skipped", packetStart, size);
                                 skipFully(is, size);
                                 bytePos += size;
                                 continue;
@@ -771,6 +790,7 @@ public class McprWorldConverter {
 
                             Long posKey = posByOffset.get(packetStart);
                             if (posKey != null && ctx.isFinal(dim, posKey)) {
+                                RrDeveloperMode.log("Packet at offset {}: {} bytes in {}, a newer copy of this chunk already has blocks, skipped", packetStart, size, dim);
                                 skipFully(is, size);
                                 bytePos += size;
                                 ctx.olderCopiesSkipped.incrementAndGet();
@@ -780,6 +800,7 @@ public class McprWorldConverter {
                             byte[] data = new byte[size];
                             try { is.readFully(data); } catch (EOFException e) { break; }
                             bytePos += size;
+                            RrDeveloperMode.log("Packet at offset {}: read {} bytes for {}, queued for decoding", packetStart, size, dim);
 
                             batch.add(new PendingChunk(packetStart, dim, data));
                             if (batch.size() >= BATCH_SIZE) {
@@ -954,6 +975,7 @@ public class McprWorldConverter {
                     }
 
                     int packetId = readVarIntBytes(data);
+                    RrDeveloperMode.log("Scan: packet {} at offset {}, id {}, {} bytes", packetCount, packetStart, packetId, length);
                     if (packetId >= 0 && packetId < notInteresting.length && notInteresting[packetId]) {
                         continue;
                     }
@@ -970,6 +992,7 @@ public class McprWorldConverter {
                     var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
                     try {
                         var pkt = gamePacketCodec.decode(buf);
+                        RrDeveloperMode.log("Scan: packet id {} decoded as {}", packetId, pkt.getClass().getSimpleName());
                         if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
                             dimPosToWinnerOffset
                                     .computeIfAbsent(currentDimension, k -> new LinkedHashMap<>())
@@ -977,13 +1000,15 @@ public class McprWorldConverter {
                             chunkPacketId = packetId;
                         } else if (pkt instanceof ClientboundLoginPacket lp) {
                             currentDimension = parseDimension(lp.commonPlayerSpawnInfo().dimension().toString());
+                            RrDeveloperMode.log("Scan: dimension is now {} (login packet)", currentDimension);
                         } else if (pkt instanceof ClientboundRespawnPacket rp) {
                             currentDimension = parseDimension(rp.commonPlayerSpawnInfo().dimension().toString());
+                            RrDeveloperMode.log("Scan: dimension is now {} (respawn packet)", currentDimension);
                         } else if (packetId >= 0 && packetId < notInteresting.length) {
                             notInteresting[packetId] = true;
                         }
-                    } catch (Exception ignored) {
-
+                    } catch (Exception e) {
+                        RrDeveloperMode.log("Scan: packet id {} at offset {} could not be decoded: {}", packetId, packetStart, e.toString());
                     }
                 }
             }

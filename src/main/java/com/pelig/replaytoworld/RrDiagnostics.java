@@ -44,10 +44,16 @@ public final class RrDiagnostics {
                 if (chord && keyEvent.key() == GLFW.GLFW_KEY_D) {
                     toggle();
                 }
+                if (chord && keyEvent.key() == GLFW.GLFW_KEY_F) {
+                    RrDeveloperMode.toggle();
+                }
                 return !chord;
             });
             ScreenEvents.afterRender(screen).register((s, g, mouseX, mouseY, tickDelta) ->
-                    drawLabel(g, client.font, s.height));
+            {
+                drawLabel(g, client.font, s.height);
+                RrDeveloperMode.drawLabel(g, client.font, s.height);
+            });
         });
     }
 

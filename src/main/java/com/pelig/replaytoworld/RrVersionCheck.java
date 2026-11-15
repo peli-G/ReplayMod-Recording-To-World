@@ -30,9 +30,15 @@ public final class RrVersionCheck {
 
     public static String findMismatch(Path recording) {
         String recorded = readRecordedVersion(recording);
-        if (VersionSupport.accepts(recorded)) return null;
-
         String current = SharedConstants.getCurrentVersion().name();
+        RrDeveloperMode.log("Version check for {}: recorded on {}, instance is {}",
+                recording.getFileName(), recorded, current);
+        if (VersionSupport.accepts(recorded)) return null;
+        if (RrDeveloperMode.isEnabled()) {
+            RrDeveloperMode.log("Version limit bypassed for {} (recorded on {}, instance is {})",
+                    recording.getFileName(), recorded, current);
+            return null;
+        }
         RrDiagnostics.info("[ReplayToWorld] Version mismatch for {}: recorded on {}, instance is {}",
                 recording.getFileName(), recorded, current);
         return "This Replay was recorded on version " + recorded + ", and you are trying to convert it on "
