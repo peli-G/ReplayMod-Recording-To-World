@@ -1,5 +1,6 @@
 package com.pelig.replaytoworld.screen;
 
+import com.pelig.replaytoworld.RrDiagnostics;
 import com.pelig.replaytoworld.RrRegistryLoader;
 import com.pelig.replaytoworld.ReplayToWorldMod;
 import com.pelig.replaytoworld.McprWorldConverter;
@@ -36,6 +37,11 @@ public final class RrConversionLauncher {
         RrBackgroundOverlay.resetForNewConversion();
 
         List<Path> paths = new ArrayList<>(recordings);
+        String mismatch = com.pelig.replaytoworld.RrVersionCheck.findMismatch(paths);
+        if (mismatch != null) {
+            com.pelig.replaytoworld.RrVersionCheck.showError(minecraft, previousScreen, mismatch);
+            return;
+        }
         if (paths.isEmpty()) {
             ReplayToWorldMod.LOGGER.warn("[RrToWorld] Convert requested with no recordings selected");
             return;
@@ -45,7 +51,7 @@ public final class RrConversionLauncher {
         var level = minecraft.level;
         var cached = ReplayToWorldMod.cachedRegistryAccess;
 
-        ReplayToWorldMod.LOGGER.info(
+        RrDiagnostics.info(
                 "[RrToWorld] Convert clicked — recordings={}, targetWorld={}, connection={}, level={}, cachedRegistryAccess={}",
                 paths.size(), targetWorld, connection != null, level != null, cached != null);
 
@@ -65,10 +71,10 @@ public final class RrConversionLauncher {
             source = "none available";
         }
 
-        ReplayToWorldMod.LOGGER.info("[RrToWorld] Using registry access source: {}", source);
+        RrDiagnostics.info("[RrToWorld] Using registry access source: {}", source);
 
         if (registryAccess == null) {
-            ReplayToWorldMod.LOGGER.info(
+            RrDiagnostics.info(
                     "[RrToWorld] No live/cached registries — loading vanilla registries in the background");
             startAfterLoadingRegistries(minecraft, previousScreen, paths, targetWorld);
             return;
@@ -77,7 +83,7 @@ public final class RrConversionLauncher {
         boolean started = targetWorld != null
                 ? McprWorldConverter.startImport(paths, registryAccess, minecraft, targetWorld)
                 : McprWorldConverter.start(paths, registryAccess, minecraft);
-        ReplayToWorldMod.LOGGER.info("[RrToWorld] McprWorldConverter start returned: {}", started);
+        RrDiagnostics.info("[RrToWorld] McprWorldConverter start returned: {}", started);
         if (started) {
             minecraft.setScreen(new RrConvertProgressScreen(previousScreen));
         }
@@ -88,7 +94,7 @@ public final class RrConversionLauncher {
 
         RrRegistryLoader.loadVanillaRegistries().thenAccept(registryAccess -> {
             minecraft.execute(() -> {
-                ReplayToWorldMod.LOGGER.info("[RrToWorld] Vanilla registries loaded, starting conversion");
+                RrDiagnostics.info("[RrToWorld] Vanilla registries loaded, starting conversion");
                 boolean started = targetWorld != null
                         ? McprWorldConverter.startImport(paths, registryAccess, minecraft, targetWorld)
                         : McprWorldConverter.start(paths, registryAccess, minecraft);

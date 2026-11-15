@@ -41,10 +41,11 @@ public class RrConvertAction {
 
         viewer.upperButtonPanel.addElements(null, convertButton, gameruleButton);
 
+        RrDiagnostics.expectViewer();
         viewer.display();
 
         int editorW = viewer.editorButton.getMinSize().getWidth();
-        ReplayToWorldMod.LOGGER.info(
+        RrDiagnostics.info(
                 "[ReplayToWorld] Gamerule Options sizing — editorButton width after display()={}", editorW);
         gameruleButton.setSize(editorW + cancelW + spacing, 20);
     }
@@ -53,11 +54,17 @@ public class RrConvertAction {
         Minecraft minecraft = Minecraft.getInstance();
         Screen previousScreen = minecraft.screen;
 
+        String mismatch = RrVersionCheck.findMismatch(replayFile.toPath());
+        if (mismatch != null) {
+            RrVersionCheck.showError(minecraft, previousScreen, mismatch);
+            return;
+        }
+
         var connection = minecraft.getConnection();
         var level = minecraft.level;
         var cached = ReplayToWorldMod.cachedRegistryAccess;
 
-        ReplayToWorldMod.LOGGER.info(
+        RrDiagnostics.info(
                 "[ReplayToWorld] Convert clicked — connection={}, level={}, cachedRegistryAccess={}",
                 connection != null, level != null, cached != null);
 
@@ -77,14 +84,14 @@ public class RrConvertAction {
             return;
         }
 
-        ReplayToWorldMod.LOGGER.info(
+        RrDiagnostics.info(
                 "[ReplayToWorld] No live/cached registries — loading vanilla registries in the background");
 
         minecraft.setScreen(new GenericMessageScreen(Component.literal("Loading registries...")));
 
         RrRegistryLoader.loadVanillaRegistries().thenAccept(loadedRegistryAccess -> {
             minecraft.execute(() -> {
-                ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Vanilla registries loaded, starting conversion");
+                RrDiagnostics.info("[ReplayToWorld] Vanilla registries loaded, starting conversion");
                 startWithRegistryAccess(replayFile, loadedRegistryAccess, minecraft, previousScreen);
             });
         }).exceptionally(throwable -> {
@@ -108,7 +115,7 @@ public class RrConvertAction {
                                                   Minecraft minecraft, Screen previousScreen) {
         McprWorldConverter.requestedWorldName = null;
         boolean started = McprWorldConverter.start(replayFile.toPath(), registryAccess, minecraft);
-        ReplayToWorldMod.LOGGER.info("[ReplayToWorld] McprWorldConverter.start() returned: {}", started);
+        RrDiagnostics.info("[ReplayToWorld] McprWorldConverter.start() returned: {}", started);
         if (started) {
             minecraft.setScreen(new com.pelig.replaytoworld.screen.RrConvertProgressScreen(previousScreen));
         }

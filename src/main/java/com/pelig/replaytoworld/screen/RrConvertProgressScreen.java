@@ -87,11 +87,18 @@ public class RrConvertProgressScreen extends Screen {
         int phaseColor = McprWorldConverter.progressFailed ? 0xFFFF5555
                 : McprWorldConverter.progressDone ? 0xFF55FF55 : 0xFFA0A0A0;
 
-        guiGraphics.drawCenteredString(this.font, phaseLabel, this.width / 2, 50, phaseColor);
+        int wrapWidth = Math.max(100, Math.min(this.width - 40, 400));
+        var phaseLines = this.font.split(Component.literal(phaseLabel), wrapWidth);
+        int labelY = 50;
+        for (var phaseLine : phaseLines) {
+            guiGraphics.drawString(this.font, phaseLine, this.width / 2 - this.font.width(phaseLine) / 2,
+                    labelY, phaseColor, false);
+            labelY += this.font.lineHeight + 2;
+        }
 
         if (McprWorldConverter.progressThreads > 1 && !McprWorldConverter.progressDone) {
             guiGraphics.drawCenteredString(this.font, "Fast convert: using " + McprWorldConverter.progressThreads + " CPU threads",
-                    this.width / 2, 64, 0xFF55FFFF);
+                    this.width / 2, labelY + 4, 0xFF55FFFF);
         }
         if (!McprWorldConverter.progressDone) {
             guiGraphics.drawCenteredString(this.font,

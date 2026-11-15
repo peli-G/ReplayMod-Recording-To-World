@@ -42,7 +42,7 @@ public class RrRegistryLoader {
             if (throwable != null) {
                 ReplayToWorldMod.LOGGER.error("[ReplayToWorld] Failed to load vanilla registries", throwable);
             } else {
-                ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Loaded vanilla registries without a world (registries: {})",
+                RrDiagnostics.info("[ReplayToWorld] Loaded vanilla registries without a world (registries: {})",
                         result.registries().count());
             }
             pending = null;

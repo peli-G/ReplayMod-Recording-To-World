@@ -40,11 +40,22 @@ public final class RrReplayViewers {
 
         GuiButton convertButton = new GuiButton();
         convertButton.setLabel("Convert to World");
-        convertButton.onClick(ignored -> {
+        Runnable convertSelected = () -> {
             List<GuiReplayViewer.GuiReplayEntry> selected = viewer.list.getSelected();
             if (selected.size() == 1) {
+                String mismatch = com.pelig.replaytoworld.RrVersionCheck.findMismatch(selected.get(0).file.toPath());
+                if (mismatch != null) {
+                    com.pelig.replaytoworld.RrVersionCheck.showError(Minecraft.getInstance(), viewer.toMinecraft(), mismatch);
+                    return;
+                }
                 Minecraft.getInstance().setScreen(new RrConvertOptionsScreen(
                         viewer.toMinecraft(), selected.get(0).file.toPath()));
+            }
+        };
+        convertButton.onClick(convertSelected);
+        viewer.list.onSelectionDoubleClicked(() -> {
+            if (convertButton.isEnabled()) {
+                convertSelected.run();
             }
         });
         // ReplayMod enables its "replay specific" buttons only while exactly one replay is selected.
@@ -54,6 +65,7 @@ public final class RrReplayViewers {
         GuiButton gameruleButton = gameruleButton(viewer);
 
         viewer.upperButtonPanel.addElements(null, convertButton, gameruleButton);
+        com.pelig.replaytoworld.RrDiagnostics.expectViewer();
         viewer.display();
         sizeUpperButtons(viewer, convertButton, gameruleButton);
     }
@@ -92,6 +104,8 @@ public final class RrReplayViewers {
         viewer.lowerButtonPanel.addElements(null, ticker);
 
         state.hookClicks();
+        viewer.list.onSelectionDoubleClicked(() -> { });
+        com.pelig.replaytoworld.RrDiagnostics.expectViewer();
         viewer.display();
         sizeUpperButtons(viewer, combineButton, gameruleButton);
         state.refresh();

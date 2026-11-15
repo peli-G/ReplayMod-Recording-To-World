@@ -85,7 +85,7 @@ public final class RrBackgroundOverlay {
         } else if (McprWorldConverter.progressFailed) {
             g.drawCenteredString(font, "Replay to World: failed", cx, y1 + 6, 0xFFFF5555);
             g.drawCenteredString(font, fit(font, McprWorldConverter.progressResultMessage, BOX_WIDTH - 8), cx, y1 + 18, 0xFFA0A0A0);
-            g.drawCenteredString(font, "See chat or the log for details", cx, y1 + 30, 0xFF808080);
+            g.drawCenteredString(font, "See the log for details", cx, y1 + 30, 0xFF808080);
         } else {
             g.drawCenteredString(font, "Replay to World: done!", cx, y1 + 6, 0xFF55FF55);
             g.drawCenteredString(font, fit(font, "saves/" + world, BOX_WIDTH - 8), cx, y1 + 18, 0xFFFFFFFF);

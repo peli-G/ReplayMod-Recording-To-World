@@ -1,5 +1,6 @@
 package com.pelig.replaytoworld.mixin.ui;
 
+import com.pelig.replaytoworld.RrDiagnostics;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -91,7 +92,7 @@ public abstract class MixinTitleScreen extends Screen {
         }
 
         AbstractWidget replayModButton = this.rr$findReplayModButton();
-        com.pelig.replaytoworld.ReplayToWorldMod.LOGGER.info(
+        RrDiagnostics.info(
                 "[ReplayToWorld] Title screen button placement — found ReplayMod button={}",
                 replayModButton != null);
 
@@ -142,7 +143,7 @@ public abstract class MixinTitleScreen extends Screen {
 
     @Unique
     private void rr$onButtonPressed() {
-        com.pelig.replaytoworld.ReplayToWorldMod.LOGGER.info("[ReplayToWorld] Title screen button pressed");
+        RrDiagnostics.info("[ReplayToWorld] Title screen button pressed");
         com.pelig.replaytoworld.screen.RrReplayViewers.openNormal();
     }
 

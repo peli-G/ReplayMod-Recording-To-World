@@ -13,15 +13,16 @@ public class ReplayToWorldMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        RrDiagnostics.install();
 
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
             cachedRegistryAccess = handler.registryAccess();
-            LOGGER.info("[ReplayToWorld] Cached RegistryAccess on world join (registries: {})",
+            RrDiagnostics.info("[ReplayToWorld] Cached RegistryAccess on world join (registries: {})",
                     cachedRegistryAccess.registries().count());
         });
 
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            LOGGER.info("[ReplayToWorld] World/connection disconnected — cached RegistryAccess from this session is still available for conversion");
+            RrDiagnostics.info("[ReplayToWorld] World/connection disconnected — cached RegistryAccess from this session is still available for conversion");
         });
 
         LOGGER.info("Replay-to-World loaded.");

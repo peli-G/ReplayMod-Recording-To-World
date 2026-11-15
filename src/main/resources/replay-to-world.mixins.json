@@ -1,9 +1,10 @@
 {
   "required": true,
   "package": "com.pelig.replaytoworld.mixin",
-  "compatibilityLevel": "JAVA_21",
+  "compatibilityLevel": "${mixin_compat}",
   "client": [
     "ClientboundLevelChunkPacketDataAccessor",
+    "ui.MixinKeyboardHandler",
     "ui.MixinTitleScreen"
   ],
   "injectors": {

@@ -4,13 +4,13 @@
   "version": "${version}",
   "name": "Replay to World",
   "description": "Converts a ReplayMod .mcpr recording into a playable singleplayer world by extracting every chunk packet from the recording.",
-  "authors": ["peli_G"],
+  "authors": ["peli_G", "PearitX2"],
   "contact": {
-    "homepage": "https://github.com/peli-G/Replay-Recording-To-World",
-    "sources":  "https://github.com/peli-G/Replay-Recording-To-World",
-    "issues":   "https://github.com/peli-G/Replay-Recording-To-World/issues"
+    "homepage": "https://github.com/peli-G/ReplayMod-Recording-To-World",
+    "sources":  "https://github.com/peli-G/ReplayMod-Recording-To-World",
+    "issues":   "https://github.com/peli-G/ReplayMod-Recording-To-World/issues"
   },
-  "license": "MIT",
+  "license": "https://github.com/peli-G/ReplayMod-Recording-To-World/blob/main/LICENSE",
   "icon": "assets/replay-to-world/favicon_logo.png",
   "environment": "client",
   "accessWidener": "replay-to-world.accesswidener",
@@ -23,9 +23,9 @@
     "replay-to-world.mixins.json"
   ],
   "depends": {
-    "fabricloader": ">=0.15.0",
-    "minecraft": ">=1.21.11 <1.21.12",
-    "java": ">=21",
+    "fabricloader": "${depends_loader}",
+    "minecraft": "${depends_minecraft}",
+    "java": "${depends_java}",
     "fabric-api": "*",
     "replaymod": "*"
   }
