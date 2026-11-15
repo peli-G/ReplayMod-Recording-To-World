@@ -22,5 +22,11 @@ Fabric API is required for this mod to work. You can download it [here](https://
 # ReplayMod
 ReplayMod is required for this mod to work. You can download it [here](https://modrinth.com/mod/replaymod).
 
+# Building
+Java 25 Required
+ - `./gradlew build` builds every version.
+ - `./gradlew :mc-1.21.11:build` or `./gradlew :mc-26.2:build` builds one version.
+ - The jars are in `versions/<version>/build/libs`.
+
 # Images
 <img width="2560" height="1440" alt="guide" src="https://github.com/user-attachments/assets/25d1f976-7aa5-46f1-b4a1-a7f41e7dbf50" />
